@@ -23,36 +23,37 @@ Control and interact with **Antigravity CLI (`agy`)** and **Multigravity CLI (`m
 ## Architecture
 
 ```mermaid
-flowchart TD
-    subgraph Telegram["📱 Mobile / Telegram Client"]
-        Msg["Send Task / Prompt\n('Fix auth bug in repo')"]
-        Notif["Receive Completion Alert\n+ Formatted Output"]
+flowchart LR
+    subgraph Client [Telegram Client]
+        Msg["Send Task Prompt"]
+        Notif["Receive Completion Alert"]
     end
 
-    subgraph Daemon["⚙️ telegravity-cli (Daemon / Bot Service)"]
-        Bot["Telegram Bot Core\n(Auth & Command Routing)"]
-        Dispatcher["Task Dispatcher\n(mgy_runner)"]
-        Observer["Session Monitor\n(Watches state transitions)"]
+    subgraph Service [telegravity-cli Daemon]
+        Bot["Bot Router"]
+        Dispatcher["Task Dispatcher"]
+        Observer["Session Monitor"]
     end
 
-    subgraph Host["💻 Target Machine (Remote Device / Host)"]
-        MGY["multigravity-cli (mgy)\n(Profile & Token Switcher)"]
-        AGY["antigravity-cli (agy)\n(AI Coding Agent & Tools)"]
-        DB["conversation_summaries.db\n& transcript.jsonl"]
+    subgraph Target [Target Device]
+        MGY["multigravity-cli (mgy)"]
+        AGY["antigravity-cli (agy)"]
+        DB[("Session DB & Transcripts")]
     end
 
-    subgraph Cloud["☁️ Google AI Cloud"]
-        Gemini["Gemini / Claude Models\n(Cloud Reasoning)"]
+    subgraph Cloud [Google AI Cloud]
+        LLM["Gemini Models"]
     end
 
     Msg --> Bot
     Bot --> Dispatcher
-    Dispatcher -->|"Local or SSH Execution"| MGY
-    MGY -->|"Activates Profile Token"| AGY
-    AGY <-->|"Prompts & Tool Calls"| Gemini
-    AGY -->|"Updates Status & Transcripts"| DB
-    DB -.->|"State Detection (RUNNING ➔ IDLE)"| Observer
-    Observer -->|"Chunked Markdown Output"| Notif
+    Dispatcher -->|Dispatch Turn| MGY
+    MGY --> AGY
+    AGY -->|Prompts & Tool Calls| LLM
+    LLM --> AGY
+    AGY -->|Record State| DB
+    DB -.->|Detects IDLE| Observer
+    Observer --> Notif
 ```
 
 ### Architecture Highlights
