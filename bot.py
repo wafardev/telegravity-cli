@@ -13,6 +13,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from telegram.request import HTTPXRequest
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
@@ -467,7 +468,14 @@ def main() -> None:
         print(f"SSH Target: {SSH_USER}@{SSH_HOST}:{SSH_PORT}")
     print(f"Active Profile: {runner.active_profile}")
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0)
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
