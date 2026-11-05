@@ -23,37 +23,61 @@ Control and interact with **Antigravity CLI (`agy`)** and **Multigravity CLI (`m
 ## Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Client [Telegram Client]
-        Msg["Send Task Prompt"]
-        Notif["Receive Completion Alert"]
-    end
+flowchart TD
+    User["📱 Telegram User"]
+    Bot["🤖 Bot Router & Auth"]
+    Dispatcher["⚡ Task Dispatcher (mgy_runner)"]
+    Agent["🧠 Antigravity Agent (mgy + agy)"]
+    Cloud["☁️ Google AI Cloud (Gemini)"]
+    DB[("💾 Session DB & Transcripts")]
+    Monitor["👁️ Passive Session Monitor"]
 
-    subgraph Service [telegravity-cli Daemon]
-        Bot["Bot Router"]
-        Dispatcher["Task Dispatcher"]
-        Observer["Session Monitor"]
-    end
+    User -->|"1. Prompt / Command"| Bot
+    Bot -->|"2. Dispatch Task"| Dispatcher
+    Dispatcher -->|"3. Execute Turn (Local or SSH)"| Agent
+    Agent <-->|"4. Tools & Cloud Reasoning"| Cloud
+    Agent -->|"5. Write State & Transcripts"| DB
+    DB -.->|"6. Detect IDLE (Finished)"| Monitor
+    Monitor -->|"7. Push Output & Diff Alert"| User
+```
 
-    subgraph Target [Target Device]
-        MGY["multigravity-cli (mgy)"]
-        AGY["antigravity-cli (agy)"]
-        DB[("Session DB & Transcripts")]
-    end
-
-    subgraph Cloud [Google AI Cloud]
-        LLM["Gemini Models"]
-    end
-
-    Msg --> Bot
-    Bot --> Dispatcher
-    Dispatcher -->|Dispatch Turn| MGY
-    MGY --> AGY
-    AGY -->|Prompts & Tool Calls| LLM
-    LLM --> AGY
-    AGY -->|Record State| DB
-    DB -.->|Detects IDLE| Observer
-    Observer --> Notif
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                            TELEGRAM CLIENT                             │
+│                     (Mobile / Desktop / Web App)                       │
+└──────────────────┬──────────────────────────────────▲──────────────────┘
+                   │                                  │
+     1. Prompt /   │                                  │ 7. Formatted Output
+        Commands   │                                  │    & Diff Alert
+                   ▼                                  │
+┌───────────────────────────────────────┐  ┌──────────┴──────────────────┐
+│          telegravity Daemon           │  │      telegravity Daemon     │
+│          [Bot Router & Auth]          │  │   [Passive Session Monitor] │
+└──────────────────┬────────────────────┘  └──────────▲──────────────────┘
+                   │                                  │
+     2. Validated  │                                  │ 6. Detect IDLE
+        Task       │                                  │    (Finished)
+                   ▼                                  │
+┌───────────────────────────────────────┐  ┌──────────┴──────────────────┐
+│       Task Dispatcher (mgy_runner)    │  │ SQLite DB & Transcript Logs │
+│         (Async Local or SSH)          │  │  (conversation_summaries)  │
+└──────────────────┬────────────────────┘  └──────────▲──────────────────┘
+                   │                                  │
+     3. Headless   │                                  │ 5. Record State
+        Dispatch   │                                  │    & Transcripts
+                   ▼                                  │
+┌─────────────────────────────────────────────────────┴──────────────────┐
+│                    TARGET MACHINE (Remote or Local)                    │
+│                                                                        │
+│   multigravity-cli (mgy)  ──►  antigravity-cli (agy)                   │
+│   (Profile & Token Switcher)   (Autonomous Agent Engine)               │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                     4. Tool Calls │
+                        & Prompts  ▼
+                     ┌───────────────────────────┐
+                     │   Google AI Cloud (LLM)   │
+                     └───────────────────────────┘
 ```
 
 ### Architecture Highlights
