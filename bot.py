@@ -63,11 +63,7 @@ async def check_auth_or_reject(update: Update) -> bool:
     if not user:
         return False
     if not is_authorized(user.id):
-        if update.message:
-            await update.message.reply_html(
-                f"⛔ Access denied.\nYour Telegram User ID is: <code>{user.id}</code>\n"
-                f"Add this ID to ALLOWED_USER_IDS in .env to grant access."
-            )
+        logger.warning(f"Unauthorized access attempt ignored from user ID: {user.id}")
         return False
     if update.effective_chat:
         known_chats.add(update.effective_chat.id)
@@ -316,7 +312,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     user_id = query.from_user.id
     if not is_authorized(user_id):
-        await query.edit_message_text("⛔ Unauthorized.")
+        logger.warning(f"Unauthorized callback attempt ignored from user ID: {user_id}")
         return
 
     data = query.data or ""
