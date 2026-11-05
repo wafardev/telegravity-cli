@@ -24,29 +24,55 @@ Control and interact with **Antigravity CLI (`agy`)** and **Multigravity CLI (`m
 
 ```mermaid
 flowchart TD
-    subgraph Mobile["📱 Mobile / Telegram Client"]
-        Msg["Send Task / Prompt\n('Fix the auth bug in repo')"]
-        Notif["Receive Done Notification\n+ Output Summary"]
+    subgraph Telegram["📱 Mobile / Telegram Client"]
+        Msg["Send Task / Prompt\n('Fix auth bug in repo')"]
+        Notif["Receive Completion Alert\n+ Formatted Output"]
     end
 
-    subgraph Daemon["⚙️ telegravity Daemon (Background Service)"]
-        Dispatcher["Task Dispatcher\n(Spawns mgy turn / stream)"]
-        Observer["Session Watcher\n(Tracks running status & idle events)"]
-        DB["conversation_summaries.db\n& transcript.jsonl Monitor"]
+    subgraph Daemon["⚙️ telegravity-cli (Daemon / Bot Service)"]
+        Bot["Telegram Bot Core\n(Auth & Command Routing)"]
+        Dispatcher["Task Dispatcher\n(mgy_runner)"]
+        Observer["Session Monitor\n(Watches state transitions)"]
     end
 
-    subgraph Engine["🤖 Antigravity Engine (mgy / agy)"]
-        Turn["Running Agent Turn\n(Tool calls, Edits, Analysis)"]
-        Finished["Turn Complete\n(status: CASCADE_RUN_STATUS_IDLE)"]
+    subgraph Host["💻 Target Machine (Raspberry Pi / Host)"]
+        MGY["multigravity-cli (mgy)\n(Profile & Token Switcher)"]
+        AGY["antigravity-cli (agy)\n(AI Coding Agent & Tools)"]
+        DB["conversation_summaries.db\n& transcript.jsonl"]
     end
 
-    Msg --> Dispatcher
-    Dispatcher -->|"mgy <profile> -c -p ... --dangerously-skip-permissions"| Turn
-    Turn --> Finished
-    Finished --> DB
-    DB --> Observer
-    Observer -->|"Format & Chunk Output"| Notif
+    subgraph Cloud["☁️ Google AI Cloud"]
+        Gemini["Gemini / Claude Models\n(Cloud Reasoning)"]
+    end
+
+    Msg --> Bot
+    Bot --> Dispatcher
+    Dispatcher -->|"Local or SSH Execution"| MGY
+    MGY -->|"Activates Profile Token"| AGY
+    AGY <-->|"Prompts & Tool Calls"| Gemini
+    AGY -->|"Updates Status & Transcripts"| DB
+    DB -.->|"State Detection (RUNNING ➔ IDLE)"| Observer
+    Observer -->|"Chunked Markdown Output"| Notif
 ```
+
+### Architecture Highlights
+
+1. **Telegram Interface & Security**:
+   - Only whitelisted Telegram User IDs (`ALLOWED_USER_IDS`) can dispatch commands.
+   - Responses are automatically split into `<3800` character chunks to respect Telegram's message limits.
+
+2. **Asynchronous Task Dispatcher (`mgy_runner`)**:
+   - Executes `mgy <profile> -c -p "<prompt>" --dangerously-skip-permissions` either locally or over SSH.
+   - Fully non-blocking so the bot remains responsive while the agent is running.
+   - Cancel running tasks anytime via `/cancel` or inline buttons.
+
+3. **Passive Session Monitor (`session_monitor`)**:
+   - Continuously watches `conversation_summaries.db` on the target machine.
+   - Detects when tasks transition from `RUNNING` (`not_fully_idle=1`) to `IDLE` (`not_fully_idle=0`).
+   - Retrieves the final `PLANNER_RESPONSE` from `transcript.jsonl` and delivers it to Telegram—even for sessions started outside Telegram (e.g., from your terminal or IDE).
+
+4. **MultiGravity Profile Management**:
+   - Seamlessly switches OAuth tokens per account while sharing conversation history, memory, and MCP servers.
 
 ---
 
@@ -70,9 +96,8 @@ flowchart TD
 
 ### 1. Installation
 
-Clone repository with submodules (includes `multigravity-cli` in `vendor/`):
 ```bash
-git clone --recurse-submodules https://github.com/wafardev/telegravity-cli.git
+git clone https://github.com/wafardev/telegravity-cli.git
 cd telegravity-cli
 
 python3 -m venv .venv
@@ -81,8 +106,7 @@ pip install -r requirements.txt
 ```
 
 > [!NOTE]
-> `multigravity-cli` (`mgy`) is bundled as a Git submodule under `vendor/multigravity-cli`.
-> If running locally, `telegravity-cli` automatically detects and uses the bundled `vendor/multigravity-cli/bin/mgy`.
+> `requirements.txt` automatically installs **`multigravity-cli`** (`mgy`) directly from GitHub into your virtual environment (`.venv/bin/mgy`).
 
 ### 2. Configuration
 

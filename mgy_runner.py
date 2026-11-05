@@ -43,11 +43,11 @@ class MgyRunner:
 
     @property
     def mgy_bin(self) -> str:
-        """Returns path to mgy binary, preferring local vendor submodule if present in local mode."""
+        """Returns path or command name to mgy binary."""
         if self.mode == "local":
-            vendor_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "vendor", "multigravity-cli", "bin", "mgy"))
-            if os.path.isfile(vendor_path) and os.access(vendor_path, os.X_OK):
-                return vendor_path
+            venv_mgy = os.path.join(os.path.dirname(__file__), ".venv", "bin", "mgy")
+            if os.path.isfile(venv_mgy) and os.access(venv_mgy, os.X_OK):
+                return venv_mgy
         return "mgy"
 
     async def run_raw(self, cmd: str, timeout: Optional[int] = None) -> Tuple[int, str, str]:
