@@ -13,7 +13,7 @@ Control and interact with **Antigravity CLI (`agy`)** and **Multigravity CLI (`m
 ## Overview
 
 `telegravity-cli` is a permanent, asynchronous daemon and Telegram bot. It lets you:
-1. **Dispatch coding tasks** from Telegram to your `agy` / `mgy` instances on your Raspberry Pi (or host machine).
+1. **Dispatch coding tasks** from Telegram to your `agy` / `mgy` instances on a remote device (or local host).
 2. **Auto-detect task completion**: As soon as the agent finishes writing code, analyzing logs, or editing files, the daemon automatically sends the formatted summary and diff to your phone.
 3. **Multi-Account Profile Management (`mgy`)**: Switch between isolated accounts and profiles directly from Telegram with inline buttons (`/profiles`, `/quotas`).
 4. **Passive External Session Monitoring**: Even if you start a task from your computer terminal or IDE and walk away, the daemon detects when it completes and pushes the output to Telegram.
@@ -35,7 +35,7 @@ flowchart TD
         Observer["Session Monitor\n(Watches state transitions)"]
     end
 
-    subgraph Host["💻 Target Machine (Raspberry Pi / Host)"]
+    subgraph Host["💻 Target Machine (Remote Device / Host)"]
         MGY["multigravity-cli (mgy)\n(Profile & Token Switcher)"]
         AGY["antigravity-cli (agy)\n(AI Coding Agent & Tools)"]
         DB["conversation_summaries.db\n& transcript.jsonl"]
@@ -118,9 +118,9 @@ cp .env.example .env
 Configure your `.env`:
 * `TELEGRAM_BOT_TOKEN`: Bot token from [@BotFather](https://t.me/BotFather).
 * `ALLOWED_USER_IDS`: Your Telegram user ID(s) (get from [@userinfobot](https://t.me/userinfobot)).
-* `RUN_MODE`: `ssh` (if running locally connecting to the Pi) or `local` (if running directly on the Pi).
+* `RUN_MODE`: `ssh` (if connecting to a remote device over SSH) or `local` (if running directly on the target machine).
 * `MGY_PROFILE`: Default profile to dispatch to (e.g. `default`).
-* `SSH_USER` & `SSH_HOST`: Target credentials (e.g. `pi`, `192.168.1.50` or your remote hostname).
+* `SSH_USER` & `SSH_HOST`: Target credentials (e.g. `user`, `192.168.1.50` or your remote hostname).
 
 ### 3. Launching the Daemon
 
@@ -128,9 +128,9 @@ Configure your `.env`:
 python bot.py
 ```
 
-### 4. Running as a Permanent 24/7 Service on the Pi (Optional)
+### 4. Running as a Permanent 24/7 Service on Remote Device (Optional)
 
-If running the daemon directly on the Raspberry Pi:
+If running the daemon directly on the remote device:
 1. Copy `telegravity.service` to `/etc/systemd/system/`:
    ```bash
    sudo cp telegravity.service /etc/systemd/system/
