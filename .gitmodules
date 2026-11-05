@@ -1,0 +1,3 @@
+[submodule "vendor/multigravity-cli"]
+	path = vendor/multigravity-cli
+	url = https://github.com/wafardev/multigravity-cli.git

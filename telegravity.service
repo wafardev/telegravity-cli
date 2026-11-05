@@ -1,0 +1,17 @@
+[Unit]
+Description=telegravity-cli: Antigravity & MultiGravity Telegram Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace 'pi' with your server username
+User=pi
+WorkingDirectory=/home/pi/telegravity-cli
+Environment=PATH=/home/pi/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/pi/telegravity-cli/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

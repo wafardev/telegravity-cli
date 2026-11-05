@@ -1,0 +1,706 @@
+#!/usr/bin/env python3
+"""
+mgy-quota - Pretty Quota Dashboard TUI for Antigravity (mgy)
+Fetches and renders real-time quotas across all profiles side-by-side.
+"""
+
+import os
+import sys
+import json
+import time
+import base64
+import re
+import shutil
+import argparse
+import subprocess
+import urllib.request
+import urllib.parse
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Enable ANSI escape sequences and UTF-8 encoding on Windows console host
+if sys.platform == "win32":
+    try:
+        os.system("")
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        ctypes.windll.kernel32.SetConsoleCP(65001)
+    except Exception:
+        pass
+    try:
+        if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+# ANSI color codes
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[90m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+
+_OAUTH_CLIENT_CACHE = None
+
+def find_agy_binary():
+    """Finds the actual agy binary across platforms for credential extraction."""
+    candidates = ["agy", "agy.exe"]
+    for name in candidates:
+        p = shutil.which(name)
+        if p and os.path.exists(p):
+            if sys.platform == "win32" and not p.lower().endswith(".exe"):
+                exe_candidate = os.path.splitext(p)[0] + ".exe"
+                if os.path.exists(exe_candidate):
+                    return exe_candidate
+            return p
+
+    home = get_real_home()
+    common_paths = [
+        os.path.join(home, ".local", "bin", "agy.exe" if sys.platform == "win32" else "agy"),
+        os.path.join(home, "bin", "agy.exe" if sys.platform == "win32" else "agy"),
+        os.path.join(home, "AppData", "Local", "Programs", "antigravity", "agy.exe"),
+        os.path.join(home, "AppData", "Local", "agy", "bin", "agy.exe"),
+    ]
+    for cp in common_paths:
+        if os.path.exists(cp):
+            return cp
+    return None
+
+def get_agy_oauth_client(refresh_token=None):
+    """Dynamically extracts Google Antigravity's public OAuth client credentials from the local agy binary."""
+    global _OAUTH_CLIENT_CACHE
+    if _OAUTH_CLIENT_CACHE:
+        return _OAUTH_CLIENT_CACHE
+
+    cid = os.environ.get("ANTIGRAVITY_CLIENT_ID")
+    sec = os.environ.get("ANTIGRAVITY_CLIENT_SECRET")
+    if cid and sec:
+        _OAUTH_CLIENT_CACHE = (cid, sec)
+        return _OAUTH_CLIENT_CACHE
+
+    agy_path = find_agy_binary()
+    if agy_path and os.path.exists(agy_path):
+        try:
+            with open(agy_path, "rb") as f:
+                content = f.read()
+            cids = list(dict.fromkeys(c.decode() for c in re.findall(rb"[0-9]+-[a-z0-9_]+\.apps\.googleusercontent\.com", content)))
+            secs = list(dict.fromkeys(s.decode() for s in re.findall(rb"GOCSPX-[A-Za-z0-9_-]{28}", content)))
+            
+            if refresh_token:
+                for c in cids:
+                    for s in secs:
+                        try:
+                            data = urllib.parse.urlencode({
+                                "client_id": c,
+                                "client_secret": s,
+                                "grant_type": "refresh_token",
+                                "refresh_token": refresh_token
+                            }).encode()
+                            req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+                            with urllib.request.urlopen(req, timeout=5) as resp:
+                                t = json.loads(resp.read().decode())
+                                if "access_token" in t:
+                                    _OAUTH_CLIENT_CACHE = (c, s)
+                                    return _OAUTH_CLIENT_CACHE
+                        except Exception:
+                            continue
+            elif cids and secs:
+                _OAUTH_CLIENT_CACHE = (cids[0], secs[0])
+                return _OAUTH_CLIENT_CACHE
+        except Exception:
+            pass
+
+    return None, None
+
+PROVIDER_ICONS = {
+    "Anthropic Claude": "◇",
+    "Google Gemini": "◆",
+    "OpenAI": "○",
+    "Other": "◌",
+}
+
+PROVIDER_ORDER = ["Anthropic Claude", "Google Gemini", "OpenAI", "Other"]
+
+MODEL_DISPLAY_NAMES = {
+    "gemini-3.6-flash-tiered": "Placeholder M196",
+    "gemini-3.7-flash-tiered": "Placeholder M301",
+    "gemini-3.8-flash-tiered": "Placeholder M322",
+    "chat_20706": "Chat Model 20706",
+    "chat_23310": "Chat Model 23310",
+    "tab_flash_lite_preview": "Tab Flash Lite (Prev)",
+    "tab_jump_flash_lite_preview": "Tab Jump Flash Lite",
+}
+
+def get_real_home():
+    real = os.environ.get("REAL_HOME")
+    if real and os.path.isdir(real):
+        return real
+    home = os.environ.get("USERPROFILE") or os.environ.get("HOME") or os.path.expanduser("~")
+    for pattern in ("/.config/multigravity-profiles", "\\.config\\multigravity-profiles"):
+        if pattern in home:
+            return home.split(pattern)[0].rstrip("/\\")
+    return os.path.expanduser("~")
+
+def get_profiles_dir():
+    custom = os.environ.get("MULTIGRAVITY_PROFILES_DIR")
+    if custom:
+        return custom
+    return os.path.join(get_real_home(), ".config", "multigravity-profiles")
+
+def read_wincred(target_names=("gemini:antigravity", "gemini/antigravity")):
+    """Reads generic credentials from Windows Credential Manager using standard library ctypes."""
+    if sys.platform != "win32":
+        return None
+    if isinstance(target_names, str):
+        target_names = [target_names]
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class CREDENTIAL(ctypes.Structure):
+            _fields_ = [
+                ("Flags", wintypes.DWORD),
+                ("Type", wintypes.DWORD),
+                ("TargetName", wintypes.LPWSTR),
+                ("Comment", wintypes.LPWSTR),
+                ("LastWritten", wintypes.FILETIME),
+                ("CredentialBlobSize", wintypes.DWORD),
+                ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+                ("Persist", wintypes.DWORD),
+                ("AttributeCount", wintypes.DWORD),
+                ("Attributes", ctypes.c_void_p),
+                ("TargetAlias", wintypes.LPWSTR),
+                ("UserName", wintypes.LPWSTR),
+            ]
+
+        advapi32 = ctypes.windll.advapi32
+        CredRead = advapi32.CredReadW
+        CredRead.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.POINTER(CREDENTIAL))]
+        CredRead.restype = wintypes.BOOL
+
+        CredFree = advapi32.CredFree
+        CredFree.argtypes = [ctypes.c_void_p]
+
+        CRED_TYPE_GENERIC = 1
+        for target_name in target_names:
+            p_cred = ctypes.POINTER(CREDENTIAL)()
+            if CredRead(target_name, CRED_TYPE_GENERIC, 0, ctypes.byref(p_cred)):
+                try:
+                    blob_size = p_cred.contents.CredentialBlobSize
+                    blob = ctypes.string_at(p_cred.contents.CredentialBlob, blob_size)
+                    return blob.decode("utf-8-sig", errors="ignore")
+                finally:
+                    CredFree(p_cred)
+    except Exception:
+        pass
+    return None
+
+def get_profile_raw_credential(name, profile_path):
+    """Retrieves raw credential data from file tokens, Windows Credential Manager, or macOS Keychain."""
+    # 1. Check profile-specific token files
+    token_candidates = [
+        os.path.join(profile_path, ".tokens", "credential.txt"),
+        os.path.join(profile_path, ".tokens", "token.json"),
+        os.path.join(profile_path, "antigravity-oauth-token"),
+        os.path.join(profile_path, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
+    ]
+    for path in token_candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    content = f.read().strip()
+                if content:
+                    return content
+            except Exception:
+                pass
+
+    # 2. Platform-specific store
+    if sys.platform == "darwin":
+        kc = os.path.join(profile_path, "Library", "Keychains", "login.keychain-db")
+        if not os.path.exists(kc):
+            kc = os.path.join(get_real_home(), "Library", "Keychains", "login.keychain-db")
+        if os.path.exists(kc):
+            try:
+                res = subprocess.run(["security", "unlock-keychain", "-p", "", kc], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if res.returncode == 0:
+                    cmd = ["security", "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w", kc]
+                    raw = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+                    if raw:
+                        return raw
+            except Exception:
+                pass
+    elif sys.platform == "win32":
+        raw = read_wincred()
+        if raw:
+            return raw
+
+    return None
+
+def get_provider(name):
+    if name.startswith("Claude") or "Anthropic" in name:
+        return "Anthropic Claude"
+    if name.startswith("Gemini") or "Google" in name:
+        return "Google Gemini"
+    if name.startswith("GPT") or "OpenAI" in name or name.startswith("OSS"):
+        return "OpenAI"
+    return "Other"
+
+def get_tier_label(tier_id):
+    if not tier_id:
+        return "STANDARD"
+    tier_upper = tier_id.upper()
+    if "PRO" in tier_upper:
+        return "PRO"
+    if "ULTRA" in tier_upper:
+        return "ULTRA"
+    if "PLUS" in tier_upper:
+        return "G1-PLUS-TIER"
+    if "FREE" in tier_upper:
+        return "FREE"
+    return tier_upper.replace("-TIER", "")
+
+def format_duration(seconds):
+    if seconds <= 0:
+        return "ready"
+    s = int(seconds)
+    hours = s // 3600
+    minutes = (s % 3600) // 60
+    secs = s % 60
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    if minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+def make_progress_bar(pct, width=10):
+    filled = int(round((pct / 100.0) * width))
+    filled = max(0, min(width, filled))
+    empty = width - filled
+    return "━" * filled + "─" * empty
+
+def get_color(pct):
+    if pct <= 10.0:
+        return RED
+    if pct <= 30.0:
+        return YELLOW
+    return GREEN
+
+def fetch_single_profile(name, profile_path):
+    result = {
+        "profile": name,
+        "authenticated": False,
+        "tier": "",
+        "total_models": 0,
+        "models": [],
+        "critical_count": 0,
+        "low_count": 0,
+        "error": None
+    }
+
+    raw = get_profile_raw_credential(name, profile_path)
+    if not raw:
+        result["error"] = "No credentials found for profile"
+        return result
+
+    try:
+        raw = raw.strip().lstrip("\ufeff")
+        if raw.startswith("go-keyring-base64:"):
+            payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8-sig", errors="ignore"))
+        else:
+            payload = json.loads(raw)
+        tok = payload.get("token", {}) if isinstance(payload, dict) and "token" in payload else payload
+        if not isinstance(tok, dict):
+            tok = {}
+        access_token = tok.get("access_token")
+        refresh_token = tok.get("refresh_token")
+        expiry_str = tok.get("expiry")
+    except Exception as e:
+        result["error"] = f"Failed to parse token: {e}"
+        return result
+
+    # Check if cached access_token is still valid
+    token_valid = False
+    if access_token and expiry_str:
+        try:
+            exp_dt = datetime.fromisoformat(expiry_str)
+            if (exp_dt - datetime.now(timezone.utc)).total_seconds() > 60:
+                token_valid = True
+        except Exception:
+            pass
+
+    # Refresh OAuth access token if expired or missing
+    if not token_valid and refresh_token:
+        cid, sec = get_agy_oauth_client(refresh_token)
+        if cid and sec:
+            try:
+                refresh_data = urllib.parse.urlencode({
+                    "client_id": cid,
+                    "client_secret": sec,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token
+                }).encode()
+                req = urllib.request.Request("https://oauth2.googleapis.com/token", data=refresh_data)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    t_data = json.loads(resp.read().decode())
+                new_token = t_data.get("access_token")
+                if new_token:
+                    access_token = new_token
+            except Exception as e:
+                if not access_token:
+                    result["error"] = f"OAuth refresh error: {e}"
+                    return result
+
+    if not access_token:
+        result["error"] = "No access token available"
+        return result
+
+    result["authenticated"] = True
+
+    # 2. Call loadCodeAssist
+    proj_id = "aicode-consumers"
+    try:
+        req1 = urllib.request.Request(
+            "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+            data=json.dumps({"metadata": {"ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}}).encode(),
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json", "User-Agent": "antigravity"}
+        )
+        with urllib.request.urlopen(req1, timeout=10) as resp:
+            res1 = json.loads(resp.read().decode())
+        
+        tier = (res1.get("paidTier") or {}).get("id") or (res1.get("currentTier") or {}).get("id") or "STANDARD"
+        result["tier"] = get_tier_label(tier)
+        proj = res1.get("cloudaicompanionProject")
+        if isinstance(proj, dict):
+            proj_id = proj.get("id") or proj_id
+        elif isinstance(proj, str) and proj:
+            proj_id = proj
+    except Exception:
+        result["tier"] = "PRO"
+
+    # 3. Call fetchAvailableModels
+    try:
+        req2 = urllib.request.Request(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            data=json.dumps({"project": proj_id}).encode(),
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json", "User-Agent": "antigravity"}
+        )
+        with urllib.request.urlopen(req2, timeout=10) as resp:
+            res2 = json.loads(resp.read().decode())
+    except Exception as e:
+        result["error"] = f"API error: {e}"
+        return result
+
+    raw_models = res2.get("models", {})
+    now_utc = datetime.now(timezone.utc)
+
+    parsed_models = []
+    critical_count = 0
+    low_count = 0
+
+    items = raw_models.items() if isinstance(raw_models, dict) else [(m.get("model", ""), m) for m in raw_models]
+    total_models = len(items)
+
+    for mid, mdata in items:
+        display_name = mdata.get("displayName") or MODEL_DISPLAY_NAMES.get(mid) or mid
+        quota_info = mdata.get("quotaInfo") or {}
+        reset_str = quota_info.get("resetTime")
+
+        # Skip background completion models that have no reset/quota limit
+        if not reset_str:
+            continue
+
+        reset_diff = 0
+        try:
+            # Handle RFC3339 format
+            dt = datetime.fromisoformat(reset_str.replace("Z", "+00:00"))
+            reset_diff = (dt - now_utc).total_seconds()
+        except Exception:
+            reset_diff = 0
+
+        # CRITICAL PROTOBUF FIX:
+        # In Google's Proto3 JSON encoding, default float value 0.0 is omitted.
+        # If resetTime is in the future but remainingFraction is absent from quotaInfo,
+        # the remaining fraction is 0.0 (quota completely consumed)!
+        if "remainingFraction" in quota_info and quota_info["remainingFraction"] is not None:
+            rem_frac = float(quota_info["remainingFraction"])
+        else:
+            # If reset time is in the past, quota is replenished; if in the future, it is 0.0
+            rem_frac = 1.0 if reset_diff <= 0 else 0.0
+
+        rem_pct = rem_frac * 100.0
+        dur_str = format_duration(reset_diff)
+
+        if rem_pct <= 10.0:
+            critical_count += 1
+        elif rem_pct <= 30.0:
+            low_count += 1
+
+        parsed_models.append({
+            "id": mid,
+            "name": display_name,
+            "provider": get_provider(display_name),
+            "pct": rem_pct,
+            "reset_str": dur_str,
+        })
+
+    result["total_models"] = total_models
+    result["models"] = parsed_models
+    result["critical_count"] = critical_count
+    result["low_count"] = low_count
+    return result
+
+def render_profile_column(data, width=56):
+    """Renders a single profile's quota dashboard into a list of strings."""
+    lines = []
+    name = data["profile"]
+    tier = data.get("tier") or "PRO"
+    models = data.get("models") or []
+    total = data.get("total_models", len(models))
+    crit = data.get("critical_count", 0)
+    low = data.get("low_count", 0)
+
+    lines.append("")
+    lines.append(f"  {BOLD}{CYAN}QUOTA DASHBOARD{RESET}")
+    lines.append(f"  {DIM}{name} [{tier}]{RESET}")
+    lines.append("")
+
+    if not data["authenticated"] or data.get("error"):
+        lines.append(f"  {RED}● Not authenticated / Error: {data.get('error')}{RESET}")
+        lines.append(f"  {DIM}Run: mgy new {name}{RESET}")
+        lines.append(f"  {DIM}{'─' * (width - 4)}{RESET}")
+        return lines
+
+    summary = f"  {DIM}{total} models{RESET}"
+    if crit > 0:
+        summary += f"  {RED}● {crit} critical{RESET}"
+    if low > 0:
+        summary += f"  {YELLOW}● {low} low{RESET}"
+    lines.append(summary)
+    lines.append(f"  {DIM}{'─' * (width - 4)}{RESET}")
+
+    # Group by provider
+    groups = {p: [] for p in PROVIDER_ORDER}
+    for m in models:
+        p = m["provider"]
+        if p not in groups:
+            groups[p] = []
+        groups[p].append(m)
+
+    for prov in PROVIDER_ORDER:
+        prov_models = groups.get(prov, [])
+        if not prov_models:
+            continue
+
+        icon = PROVIDER_ICONS.get(prov, "•")
+        lines.append("")
+        lines.append(f"  {BOLD}{icon} {prov}{RESET}")
+
+        # Sort models alphabetically by name
+        prov_models.sort(key=lambda x: x["name"])
+
+        for m in prov_models:
+            dname = m["name"]
+            for prefix in ["Gemini ", "Claude ", "GPT-"]:
+                if dname.startswith(prefix):
+                    dname = dname[len(prefix):]
+            if len(dname) > 22:
+                dname = dname[:21] + "…"
+
+            bar = make_progress_bar(m["pct"], 10)
+            col = get_color(m["pct"])
+            pct_val = m["pct"]
+            pct_str = f"{pct_val:5.1f}%"
+            time_str = f"{m['reset_str']:>8}"
+
+            line = f"    {dname:<22} {bar} {col}{pct_str}{RESET} {DIM}{time_str}{RESET}"
+            lines.append(line)
+
+    lines.append("")
+    return lines
+
+def strip_ansi(text):
+    import re
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+def pad_visible(line, target_width):
+    visible_len = len(strip_ansi(line))
+    padding = max(0, target_width - visible_len)
+    return line + (" " * padding)
+
+def get_terminal_width():
+    # 1. Environment variable COLUMNS
+    if os.environ.get("COLUMNS"):
+        try:
+            val = int(os.environ["COLUMNS"])
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+
+    # 2. Python's os.get_terminal_size() on stdout, stdin, stderr
+    for fd in (sys.stdout, sys.stdin, sys.stderr, sys.__stdout__, sys.__stdin__, sys.__stderr__):
+        if fd is not None:
+            try:
+                val = os.get_terminal_size(fd.fileno()).columns
+                if val > 0:
+                    return val
+            except (AttributeError, ValueError, OSError):
+                pass
+
+    # 3. Windows CONOUT$ console handle
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            import struct
+            handle = ctypes.windll.kernel32.CreateFileW("CONOUT$", 0x80000000 | 0x40000000, 1 | 2, None, 3, 0, None)
+            if handle != -1 and handle != 0:
+                csbi = ctypes.create_string_buffer(22)
+                if ctypes.windll.kernel32.GetConsoleScreenBufferInfo(handle, csbi):
+                    (bufx, bufy, curx, cury, wattr, left, top, right, bottom, maxx, maxy) = struct.unpack("hhhhHhhhhhh", csbi.raw)
+                    width = right - left + 1
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    if width > 0:
+                        return width
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+    # 4. /dev/tty ioctl
+    try:
+        with open("/dev/tty", "r") as f:
+            val = os.get_terminal_size(f.fileno()).columns
+            if val > 0:
+                return val
+    except Exception:
+        pass
+
+    # 5. tput cols
+    try:
+        output = subprocess.check_output(["tput", "cols"], stderr=subprocess.DEVNULL).decode().strip()
+        val = int(output)
+        if val > 0:
+            return val
+    except Exception:
+        pass
+
+    # 6. Fallback
+    return shutil.get_terminal_size(fallback=(80, 24)).columns
+
+def render_side_by_side(all_columns, term_width, col_width=56, forced_cols=None):
+    """Combines rendered column lists into multi-column layout with │ separator."""
+    if forced_cols and forced_cols > 0:
+        num_cols = min(forced_cols, len(all_columns))
+    else:
+        # Each column takes col_width, separator takes 3 chars (' │ ')
+        # k columns need: k * (col_width + 3) - 3 <= term_width
+        fit_cols = (term_width + 3) // (col_width + 3)
+        num_cols = max(1, min(fit_cols, len(all_columns)))
+
+    output_lines = []
+
+    for i in range(0, len(all_columns), num_cols):
+        batch = all_columns[i:i + num_cols]
+        max_rows = max(len(col) for col in batch)
+
+        # Pad all columns in batch to max_rows
+        padded_batch = []
+        for col in batch:
+            col_padded = col + [""] * (max_rows - len(col))
+            padded_batch.append(col_padded)
+
+        for row_idx in range(max_rows):
+            row_parts = []
+            for col_idx, col in enumerate(padded_batch):
+                line = col[row_idx]
+                if col_idx < len(padded_batch) - 1:
+                    row_parts.append(pad_visible(line, col_width))
+                else:
+                    row_parts.append(line)
+            
+            separator = f" {DIM}│{RESET} "
+            output_lines.append(separator.join(row_parts))
+        
+        output_lines.append("")
+
+    return "\n".join(output_lines)
+
+def run_dashboard(selected_profile=None, forced_cols=None):
+    profiles_dir = get_profiles_dir()
+    if not os.path.exists(profiles_dir):
+        print(f"No profiles found in {profiles_dir}")
+        return
+
+    if selected_profile:
+        profile_path = os.path.join(profiles_dir, selected_profile)
+        if not os.path.isdir(profile_path):
+            print(f"Error: profile '{selected_profile}' does not exist.")
+            sys.exit(1)
+        targets = [(selected_profile, profile_path)]
+    else:
+        targets = [
+            (d, os.path.join(profiles_dir, d))
+            for d in sorted(os.listdir(profiles_dir))
+            if os.path.isdir(os.path.join(profiles_dir, d))
+        ]
+
+    if not targets:
+        print("No profiles found.")
+        return
+
+    # Fetch data in parallel
+    results = []
+    with ThreadPoolExecutor(max_workers=len(targets)) as ex:
+        futs = {ex.submit(fetch_single_profile, name, path): name for name, path in targets}
+        for fut in as_completed(futs):
+            results.append(fut.result())
+
+    # Maintain original sorted order
+    name_order = {name: i for i, (name, _) in enumerate(targets)}
+    results.sort(key=lambda x: name_order.get(x["profile"], 0))
+
+    col_width = 56
+    rendered_cols = [render_profile_column(r, col_width) for r in results]
+
+    term_width = get_terminal_width()
+    print(render_side_by_side(rendered_cols, term_width, col_width, forced_cols))
+
+def main():
+    parser = argparse.ArgumentParser(description="mgy Quota Dashboard TUI")
+    parser.add_argument("profile", nargs="?", help="Optional specific profile name")
+    parser.add_argument("-w", "--watch", type=int, nargs="?", const=10, help="Live watch mode with refresh interval in seconds")
+    parser.add_argument("-c", "--cols", "--columns", type=int, help="Force number of side-by-side columns")
+    parser.add_argument("-1", dest="cols_1", action="store_true", help="Display 1 column")
+    parser.add_argument("-2", dest="cols_2", action="store_true", help="Display 2 columns side-by-side")
+    parser.add_argument("-3", dest="cols_3", action="store_true", help="Display 3 columns side-by-side")
+    parser.add_argument("-4", dest="cols_4", action="store_true", help="Display 4 columns side-by-side")
+    parser.add_argument("--json", action="store_true", help="Output raw JSON")
+    args = parser.parse_args()
+
+    forced_cols = args.cols
+    if args.cols_1: forced_cols = 1
+    elif args.cols_2: forced_cols = 2
+    elif args.cols_3: forced_cols = 3
+    elif args.cols_4: forced_cols = 4
+
+    if args.watch:
+        try:
+            while True:
+                # Clear terminal screen
+                sys.stdout.write("\033[H\033[2J")
+                sys.stdout.flush()
+                run_dashboard(args.profile, forced_cols)
+                time.sleep(args.watch)
+        except KeyboardInterrupt:
+            print("\nExiting watch mode.")
+    else:
+        run_dashboard(args.profile, forced_cols)
+
+if __name__ == "__main__":
+    main()

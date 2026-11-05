@@ -1,0 +1,32 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Python cache & artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Environment files and credentials
+.env
+.env.local
+.env.*.local
+*.token*
+.tokens/
+
+# Logs and SQLite databases
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.bak
+*.tar.gz
+
+# OS specific
+.DS_Store
+Thumbs.db
