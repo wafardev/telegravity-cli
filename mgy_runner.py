@@ -85,6 +85,64 @@ class MgyRunner:
             finally:
                 self._active_proc = None
 
+    async def get_mgy_list(self) -> str:
+        """Returns the raw output of 'mgy list' from the device."""
+        code, out, err = await self.run_raw(f"{self.mgy_bin} list", timeout=15)
+        if code == 0:
+            return out.strip()
+        return (out + "\n" + err).strip() or "No profiles found or error running mgy list."
+
+    async def get_instances(self) -> List[Dict[str, str]]:
+        """
+        Returns active mgy and agy instances running on the target device.
+        Each entry contains: {'pid': str, 'cmd': str, 'type': 'mgy'|'agy'}
+        """
+        code, out, _ = await self.run_raw("ps -eo pid,ppid,args", timeout=15)
+        if code != 0 or not out:
+            return []
+
+        lines = out.splitlines()
+        instances: List[Dict[str, str]] = []
+        mgy_pids = set()
+
+        # First pass: find mgy processes
+        for line in lines[1:]:
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid, ppid, args = parts[0], parts[1], parts[2]
+
+            # Ignore daemon, grep, and editor processes
+            if "telegravity" in args or "grep" in args:
+                continue
+
+            # Match mgy invocation (e.g. bash .../mgy <profile> ..., mgy <profile> ...)
+            match = re.search(r"(?:^|[\s/])mgy(?:\.sh|\.py)?(?:\s+(.*))?$", args)
+            if match:
+                mgy_args = (match.group(1) or "").strip()
+                cmd_clean = f"mgy {mgy_args}".strip()
+                instances.append({"pid": pid, "cmd": cmd_clean, "type": "mgy"})
+                mgy_pids.add(pid)
+
+        # Second pass: find standalone agy processes whose parent is not mgy
+        for line in lines[1:]:
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid, ppid, args = parts[0], parts[1], parts[2]
+            if "telegravity" in args or "grep" in args:
+                continue
+            if ppid in mgy_pids:
+                continue
+
+            match = re.search(r"(?:^|[\s/])agy(?:\s+(.*))?$", args)
+            if match:
+                agy_args = (match.group(1) or "").strip()
+                cmd_clean = f"agy {agy_args}".strip()
+                instances.append({"pid": pid, "cmd": cmd_clean, "type": "agy"})
+
+        return instances
+
     async def list_profiles(self) -> List[Dict[str, str]]:
         """Lists available multigravity profiles."""
         code, out, _ = await self.run_raw(f"{self.mgy_bin} list", timeout=15)

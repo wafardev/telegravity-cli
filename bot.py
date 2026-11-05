@@ -145,6 +145,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"<b>Remote CWD:</b> <code>{cwd}</code>\n\n"
         f"<b>Usage:</b>\n"
         f"• <b>Send any message</b> to dispatch an agy task via mgy.\n"
+        f"• <code>/list</code> - Run 'mgy list' on the device.\n"
+        f"• <code>/instances</code> - List running mgy & agy process PIDs.\n"
         f"• <code>/profiles</code> - View and switch mgy profiles.\n"
         f"• <code>/quotas</code> - Check profile token & model quotas.\n"
         f"• <code>/conversations</code> - List recent sessions.\n"
@@ -155,6 +157,47 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     if update.message:
         await update.message.reply_html(welcome_text)
+
+
+async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Returns raw output of 'mgy list' from the device."""
+    if not await check_auth_or_reject(update):
+        return
+
+    if update.message:
+        await update.message.reply_chat_action(ChatAction.TYPING)
+
+    output = await runner.get_mgy_list()
+    await send_chunked_code(
+        chat_id=update.effective_chat.id,
+        bot=context.bot,
+        text=output or "(no output from mgy list)",
+        header="📋 <b>mgy list:</b>",
+    )
+
+
+async def instances_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Returns PIDs and command lines of active mgy/agy instances on the target device."""
+    if not await check_auth_or_reject(update):
+        return
+
+    if update.message:
+        await update.message.reply_chat_action(ChatAction.TYPING)
+
+    instances = await runner.get_instances()
+    if not instances:
+        if update.message:
+            await update.message.reply_html(
+                "🔍 <b>Active Instances:</b>\n<i>No running mgy or agy instances found on target device.</i>"
+            )
+        return
+
+    lines = ["🔍 <b>Active Instances:</b>\n"]
+    for inst in instances:
+        lines.append(f"• <b>PID:</b> <code>{inst['pid']}</code>\n  <code>{html.escape(inst['cmd'])}</code>")
+
+    if update.message:
+        await update.message.reply_html("\n".join(lines))
 
 
 async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -475,6 +518,8 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
+    app.add_handler(CommandHandler("list", list_command))
+    app.add_handler(CommandHandler("instances", instances_command))
     app.add_handler(CommandHandler("profiles", profiles_command))
     app.add_handler(CommandHandler("quotas", quotas_command))
     app.add_handler(CommandHandler("conversations", conversations_command))

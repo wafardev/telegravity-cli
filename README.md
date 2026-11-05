@@ -106,6 +106,8 @@ flowchart TD
 | Command              | Description                                                    |
 | :------------------- | :------------------------------------------------------------- |
 | **Any text message** | Dispatches a task prompt to `mgy` using the active profile     |
+| `/list`              | Output raw `mgy list` from the target device                   |
+| `/instances`         | List running `mgy` and `agy` process PIDs and commands         |
 | `/profiles`          | List all multigravity profiles and switch with tap buttons     |
 | `/quotas`            | View quota usage across all profiles                           |
 | `/conversations`     | View recent sessions with live status (`⚡ RUNNING` / `🟢 IDLE`) |
