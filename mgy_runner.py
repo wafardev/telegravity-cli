@@ -698,6 +698,7 @@ sys.exit(res.returncode)
         # Extract latest output from transcript
         content = ""
         status = "unknown"
+        latest_step = -1
         if found_cid:
             tpath = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{found_cid}/.system_generated/logs/transcript.jsonl")
             if os.path.exists(tpath):
@@ -708,6 +709,7 @@ sys.exit(res.returncode)
                         try:
                             entry = json.loads(line)
                             m_type = entry.get("type")
+                            s_idx = int(entry.get("step_index", -1))
                             c_text = entry.get("content", "").strip()
                             th_text = entry.get("thinking", "").strip()
                             t_calls = entry.get("tool_calls", [])
@@ -715,15 +717,18 @@ sys.exit(res.returncode)
                                 if c_text:
                                     content = c_text
                                     status = "completed"
+                                    latest_step = s_idx
                                     break
                                 elif th_text:
                                     content = f"[Thinking]: {th_text}"
                                     status = "thinking"
+                                    latest_step = s_idx
                                     break
                                 elif t_calls:
                                     names = [t.get("name", "tool") for t in t_calls]
                                     content = f"[Tool Call]: {', '.join(names)}"
                                     status = "tool_call"
+                                    latest_step = s_idx
                                     break
                         except Exception:
                             pass
@@ -754,6 +759,7 @@ sys.exit(res.returncode)
             "conversation_title": found_title,
             "content": content,
             "transcript_status": status,
+            "step_index": latest_step,
         }
 
     async def peek_instance(self, pid: int) -> Dict[str, Any]:
@@ -846,6 +852,7 @@ if os.path.exists(db):
         pass
 content = ""
 status = "unknown"
+latest_step = -1
 if found_cid:
     tpath = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{found_cid}/.system_generated/logs/transcript.jsonl")
     if os.path.exists(tpath):
@@ -856,6 +863,7 @@ if found_cid:
                 try:
                     entry = json.loads(line)
                     m_type = entry.get("type")
+                    s_idx = int(entry.get("step_index", -1))
                     c_text = entry.get("content", "").strip()
                     th_text = entry.get("thinking", "").strip()
                     t_calls = entry.get("tool_calls", [])
@@ -863,21 +871,24 @@ if found_cid:
                         if c_text:
                             content = c_text
                             status = "completed"
+                            latest_step = s_idx
                             break
                         elif th_text:
                             content = f"[Thinking]: {th_text}"
                             status = "thinking"
+                            latest_step = s_idx
                             break
                         elif t_calls:
                             names = [t.get("name", "tool") for t in t_calls]
                             content = f"[Tool Call]: {', '.join(names)}"
                             status = "tool_call"
+                            latest_step = s_idx
                             break
                 except Exception:
                     pass
         except Exception:
             pass
-print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_title": found_title, "content": content, "transcript_status": status}))
+print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_title": found_title, "content": content, "transcript_status": status, "step_index": latest_step}))
 """
             b64_script = base64.b64encode(inspect_code.strip().encode()).decode()
             code_p, out_p, _ = await self.run_raw(f"PEEK_PID={pid} python3 -c \"import base64; exec(base64.b64decode('{b64_script}'))\"", timeout=8)
@@ -900,6 +911,8 @@ print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_tit
                 "conversation_id": res.get("conversation_id"),
                 "conversation_title": res.get("conversation_title"),
                 "content": res_content or ("(Waiting for first output from prompt...)" if is_running else "(No recent answer found)"),
+                "step_index": res.get("step_index", -1),
+                "transcript_status": res.get("transcript_status", "unknown"),
             }
 
         return {

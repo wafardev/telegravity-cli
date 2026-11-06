@@ -383,6 +383,108 @@ async def peek_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_html(text, reply_markup=markup)
 
 
+async def _wait_for_injected_response(
+    pid: int,
+    profile: str,
+    prompt: str,
+    initial_step: int,
+    initial_content: str,
+    initial_cid: Optional[str],
+    status_msg,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Waits for the interactive instance to complete its turn and delivers the response."""
+    poll_count = 0
+    max_polls = 600  # 600 * 0.8s = 480 seconds (8 mins)
+
+    while poll_count < max_polls:
+        await asyncio.sleep(0.8)
+        poll_count += 1
+
+        info = await runner.peek_instance(pid)
+        if not info.get("found"):
+            # Process terminated or closed
+            try:
+                await status_msg.edit_text(
+                    f"⌨️ <b>PID <code>{pid}</code> terminated.</b>\n<b>Prompt:</b> <code>{html.escape(prompt[:80])}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            return
+
+        is_depleted = info.get("is_quota_depleted", False)
+        content = info.get("content", "").strip()
+        status = info.get("transcript_status", "")
+        curr_step = info.get("step_index", -1)
+        cid = info.get("conversation_id") or initial_cid
+
+        if is_depleted or "Individual quota reached" in content:
+            # Quota exhausted
+            try:
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas")]])
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ <b>Quota Limit Reached on PID <code>{pid}</code>!</b>\n<pre><code>{html.escape(content)}</code></pre>",
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+            except Exception:
+                pass
+            return
+
+        # Check if new response has finished
+        new_step_completed = (
+            (curr_step > initial_step and curr_step != -1) or
+            (content and content != initial_content and not content.startswith("[Thinking]") and not content.startswith("[Tool Call]"))
+        )
+
+        if new_step_completed and status == "completed" and content and content != "(Waiting for first output from prompt...)":
+            # Update the waiting status message
+            try:
+                buttons = [
+                    [
+                        InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
+                        InlineKeyboardButton(f"🛑 Cancel {pid}", callback_data=f"cancel_task:{pid}"),
+                        InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
+                    ]
+                ]
+                await status_msg.edit_text(
+                    f"⌨️ <b>Injected prompt into PID <code>{pid}</code></b> (<b>{html.escape(profile)}</b>)\n"
+                    f"<b>Prompt:</b> <code>{html.escape(prompt[:100])}</code>\n\n"
+                    f"✅ <i>Response received!</i>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
+            except Exception:
+                pass
+
+            # Deliver response message to chat
+            reply_buttons = [
+                [
+                    InlineKeyboardButton(f"🚀 Run {pid}", callback_data=f"run_inst:{pid}"),
+                    InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
+                    InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
+                ]
+            ]
+            markup = InlineKeyboardMarkup(reply_buttons)
+            header = f"💬 <b>Response from PID <code>{pid}</code> (<b>{html.escape(profile)}</b>):</b>"
+
+            # Mark conversation handled in SessionMonitor
+            if cid:
+                monitor.mark_handled(cid, curr_step)
+
+            await send_chunked_code(
+                chat_id=chat_id,
+                bot=context.bot,
+                text=content,
+                header=header,
+                reply_markup=markup,
+            )
+            return
+
+
 async def _dispatch_to_pid_or_spawn(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -400,24 +502,44 @@ async def _dispatch_to_pid_or_spawn(
         if update.message:
             await update.message.reply_chat_action(ChatAction.TYPING)
 
+        initial_info = await runner.peek_instance(pid)
+        init_step = initial_info.get("step_index", -1)
+        init_content = initial_info.get("content", "")
+        init_cid = initial_info.get("conversation_id") or cid
+
         success, msg = await runner.inject_input_to_pid(pid, prompt)
         if success:
             action_buttons = [
                 [
-                    InlineKeyboardButton(f"👁️ Peek PID {pid}", callback_data=f"peek:{pid}"),
-                    InlineKeyboardButton(f"🛑 Cancel Task", callback_data=f"cancel_task:{pid}"),
+                    InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
+                    InlineKeyboardButton(f"🛑 Cancel {pid}", callback_data=f"cancel_task:{pid}"),
+                    InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
                 ]
             ]
             text = (
                 f"⌨️ <b>Injected prompt into PID <code>{pid}</code></b> (<b>{html.escape(profile)}</b>)\n"
                 f"<b>Prompt:</b> <code>{html.escape(preview_prompt)}</code>\n\n"
-                f"<i>Keystrokes typed directly into existing instance without opening a new one.</i>"
+                f"⏳ <i>Waiting for response...</i>"
             )
             markup = InlineKeyboardMarkup(action_buttons)
             if update.message:
-                await update.message.reply_html(text, reply_markup=markup)
+                status_msg = await update.message.reply_html(text, reply_markup=markup)
             else:
-                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
+                status_msg = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
+
+            asyncio.create_task(
+                _wait_for_injected_response(
+                    pid=pid,
+                    profile=profile,
+                    prompt=prompt,
+                    initial_step=init_step,
+                    initial_content=init_content,
+                    initial_cid=init_cid,
+                    status_msg=status_msg,
+                    chat_id=chat_id,
+                    context=context,
+                )
+            )
         else:
             err_text = f"❌ <b>Failed to type into PID <code>{pid}</code>:</b> {html.escape(msg)}"
             if update.message:

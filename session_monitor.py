@@ -16,7 +16,18 @@ class SessionMonitor:
         self.poll_interval = poll_interval
         self._running = False
         self._known_states: Dict[str, int] = {}  # conv_id -> not_fully_idle (1 or 0)
+        self._known_steps: Dict[str, int] = {}   # conv_id -> step_count
+        self._handled_conv_steps: Dict[str, int] = {}  # conv_id -> latest handled step_index
         self._on_task_completed_cb: Optional[Callable[[Dict[str, Any], str], Any]] = None
+
+    def mark_handled(self, conversation_id: str, step_index: int) -> None:
+        """Marks a conversation step as already delivered to user chat to prevent duplicate alerts."""
+        if conversation_id:
+            self._handled_conv_steps[conversation_id] = max(self._handled_conv_steps.get(conversation_id, -1), step_index)
+
+    def is_handled(self, conversation_id: str, step_index: int) -> bool:
+        """Returns True if the step was already delivered."""
+        return self._handled_conv_steps.get(conversation_id, -1) >= step_index
 
     def on_task_completed(self, callback: Callable[[Dict[str, Any], str], Any]) -> None:
         """Register a callback when a task finishes: callback(conv_info, output_text)"""
@@ -32,7 +43,7 @@ if not os.path.exists(db):
     exit(0)
 conn = sqlite3.connect(db)
 conn.row_factory = sqlite3.Row
-rows = conn.execute("SELECT conversation_id, title, preview, status, not_fully_idle, datetime(last_modified_time) as last_mod FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT {limit}").fetchall()
+rows = conn.execute("SELECT conversation_id, title, preview, step_count, status, not_fully_idle, datetime(last_modified_time) as last_mod FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT {limit}").fetchall()
 print(json.dumps([dict(r) for r in rows]))
 """
         cmd = f"python3 -c '{query_code.strip()}'"
@@ -96,6 +107,8 @@ print(output)
             cid = c.get("conversation_id")
             if cid:
                 self._known_states[cid] = int(c.get("not_fully_idle", 0))
+                self._known_steps[cid] = int(c.get("step_count", 0))
+                self._handled_conv_steps[cid] = int(c.get("step_count", 0))
 
         while self._running:
             try:
@@ -109,24 +122,33 @@ print(output)
 
                     current_idle_flag = int(c.get("not_fully_idle", 0))
                     prev_flag = self._known_states.get(cid)
-
-                    # Update state
                     self._known_states[cid] = current_idle_flag
 
-                    # Detect transition from RUNNING (1) -> IDLE (0)
-                    if prev_flag == 1 and current_idle_flag == 0:
-                        logger.info("Detected task completion for conversation %s (%s)", cid, c.get("title"))
-                        latest_output = await self.get_latest_output(cid)
-                        if not latest_output:
-                            latest_output = c.get("preview", "")
+                    curr_steps = int(c.get("step_count", 0))
+                    prev_steps = self._known_steps.get(cid)
+                    self._known_steps[cid] = curr_steps
 
-                        if self._on_task_completed_cb:
-                            try:
-                                res = self._on_task_completed_cb(c, latest_output)
-                                if asyncio.iscoroutine(res):
-                                    await res
-                            except Exception as cb_err:
-                                logger.error("Error in on_task_completed callback: %s", cb_err)
+                    # Completion detected if:
+                    # 1. State transitioned from running (1) -> idle (0)
+                    # 2. Or step_count incremented and current state is idle (0)
+                    step_incremented = (prev_steps is not None and curr_steps > prev_steps)
+                    state_finished = (prev_flag == 1 and current_idle_flag == 0)
+
+                    if (state_finished or step_incremented) and current_idle_flag == 0:
+                        if not self.is_handled(cid, curr_steps):
+                            self.mark_handled(cid, curr_steps)
+                            logger.info("Detected task completion for conversation %s (%s, step: %s)", cid, c.get("title"), curr_steps)
+                            latest_output = await self.get_latest_output(cid)
+                            if not latest_output:
+                                latest_output = c.get("preview", "")
+
+                            if self._on_task_completed_cb:
+                                try:
+                                    res = self._on_task_completed_cb(c, latest_output)
+                                    if asyncio.iscoroutine(res):
+                                        await res
+                                except Exception as cb_err:
+                                    logger.error("Error in on_task_completed callback: %s", cb_err)
 
             except asyncio.CancelledError:
                 break
