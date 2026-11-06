@@ -15,7 +15,7 @@ Control and interact with **Antigravity CLI (`agy`)** and **Multigravity CLI (`m
 `telegravity-cli` is a permanent, asynchronous daemon and Telegram bot. It lets you:
 1. **Dispatch coding tasks** from Telegram to your `agy` / `mgy` instances on a remote device (or local host).
 2. **Auto-detect task completion**: As soon as the agent finishes writing code, analyzing logs, or editing files, the daemon automatically sends the formatted summary and diff to your phone.
-3. **Multi-Account Profile Management (`mgy`)**: Switch between isolated accounts and profiles directly from Telegram with inline buttons (`/profiles`, `/quotas`).
+3. **Multi-Account Profile Management (`mgy`)**: Bind chat sessions to specific accounts/profiles (`/new <profile> [conv]`, `/quotas`).
 4. **Passive External Session Monitoring**: Even if you start a task from your computer terminal or IDE and walk away, the daemon detects when it completes and pushes the output to Telegram.
 
 ---
@@ -103,19 +103,19 @@ flowchart TD
 
 ## Features & Commands
 
-| Command              | Description                                                    |
-| :------------------- | :------------------------------------------------------------- |
-| **Any text message** | Dispatches a task prompt to `mgy` using the active profile     |
-| `/list`              | Output raw `mgy list` from the target device                   |
-| `/instances`         | List running `mgy` and `agy` process PIDs and commands         |
-| `/profiles`          | List all multigravity profiles and switch with tap buttons     |
-| `/quotas`            | Output raw `mgy quotas` from the target device                 |
-| `/conversations`     | View recent sessions with live status (`⚡ RUNNING` / `🟢 IDLE`) |
-| `/new`               | Start a fresh session (clears conversation context)            |
-| `/cancel`            | Abort/interrupt the currently running task                     |
-| `/cd <path>`         | Change working directory on target host                        |
-| `/pwd`               | View current working directory                                 |
-| `/status`            | View host health, load, active profile, and runner state       |
+| Command                      | Description                                                    |
+| :--------------------------- | :------------------------------------------------------------- |
+| **Any text message**         | Dispatches a task prompt to `mgy` using the session profile    |
+| `/list`                      | Output raw `mgy list` from the target device                   |
+| `/instances`                 | List running `mgy` and `agy` process PIDs and commands         |
+| `/quotas`                    | Output raw `mgy quotas` from the target device                 |
+| `/conversations`             | View recent sessions with live status (`⚡ RUNNING` / `🟢 IDLE`) |
+| `/new <profile> [conv]`      | Bind chat session to a profile and optional conversation ID    |
+| `/cancel [pid]`              | Abort/interrupt running task (shows PID and supports cancel by PID) |
+| `/kill <pid>`                | Terminate any process by PID on the target device              |
+| `/cd <path>`                 | Change working directory on target host                        |
+| `/pwd`                       | View current working directory                                 |
+| `/status`                    | View host health, load, session profile, and runner state      |
 
 ---
 

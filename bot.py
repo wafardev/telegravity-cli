@@ -47,8 +47,8 @@ logger = logging.getLogger(__name__)
 runner = MgyRunner(mode=RUN_MODE, default_profile=MGY_PROFILE)
 monitor = SessionMonitor(runner=runner)
 
-# Active conversation tracking per chat (chat_id -> conversation_id or None)
-active_conversations: dict[int, Optional[str]] = {}
+# Active session tracking per chat (chat_id -> {"profile": str, "conversation_id": Optional[str]})
+chat_sessions: dict[int, dict] = {}
 # Known authorized chats to notify on external completion
 known_chats: Set[int] = set()
 
@@ -69,6 +69,15 @@ async def check_auth_or_reject(update: Update) -> bool:
     if update.effective_chat:
         known_chats.add(update.effective_chat.id)
     return True
+
+
+def get_chat_session(chat_id: int) -> dict:
+    if chat_id not in chat_sessions:
+        chat_sessions[chat_id] = {
+            "profile": runner.default_profile or "default",
+            "conversation_id": None,
+        }
+    return chat_sessions[chat_id]
 
 
 async def send_chunked_code(
@@ -133,26 +142,28 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await check_auth_or_reject(update):
         return
 
+    chat_id = update.effective_chat.id
+    session = get_chat_session(chat_id)
     cwd = runner.current_dir or "~"
     target_display = f"{SSH_USER}@{SSH_HOST}:{SSH_PORT}" if RUN_MODE == "ssh" else "Local Machine"
-    active_cid = active_conversations.get(update.effective_chat.id)
+    active_cid = session.get("conversation_id")
     cid_str = active_cid[:8] if active_cid else "Latest / Active"
 
     welcome_text = (
         f"⚡ <b>telegravity daemon ready</b>\n\n"
         f"<b>Target:</b> <code>{target_display}</code>\n"
-        f"<b>Profile:</b> <code>{runner.active_profile}</code>\n"
+        f"<b>Profile:</b> <code>{session['profile']}</code>\n"
         f"<b>Session:</b> <code>{cid_str}</code>\n"
         f"<b>Remote CWD:</b> <code>{cwd}</code>\n\n"
         f"<b>Usage:</b>\n"
         f"• <b>Send any message</b> to dispatch an agy task via mgy.\n"
         f"• <code>/list</code> - Run 'mgy list' on the device.\n"
         f"• <code>/instances</code> - List running mgy & agy process PIDs.\n"
-        f"• <code>/profiles</code> - View and switch mgy profiles.\n"
         f"• <code>/quotas</code> - Run 'mgy quotas' on the device.\n"
         f"• <code>/conversations</code> - List recent sessions.\n"
-        f"• <code>/new</code> - Start a brand new conversation.\n"
-        f"• <code>/cancel</code> - Cancel ongoing task execution.\n"
+        f"• <code>/new &lt;profile&gt; [conv]</code> - Bind session to profile & conversation.\n"
+        f"• <code>/cancel [pid]</code> - Cancel running task (appends PID).\n"
+        f"• <code>/kill &lt;pid&gt;</code> - Kill any process by PID.\n"
         f"• <code>/cd &lt;path&gt;</code> - Change target directory.\n"
         f"• <code>/status</code> - View host and task status."
     )
@@ -201,33 +212,6 @@ async def instances_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_html("\n".join(lines))
 
 
-async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await check_auth_or_reject(update):
-        return
-
-    profiles = await runner.list_profiles()
-    if not profiles:
-        if update.message:
-            await update.message.reply_text("No multigravity profiles found.")
-        return
-
-    keyboard = []
-    text_lines = ["👥 <b>Multigravity Profiles:</b>\n"]
-    for p in profiles:
-        name = p["name"]
-        email = f" ({p['email']})" if p.get("email") else ""
-        is_active = (name == runner.active_profile)
-        prefix = "✅ " if is_active else "  • "
-        text_lines.append(f"{prefix}<code>{name}</code>{email}")
-
-        btn_text = f"✅ {name}" if is_active else f"Select {name}"
-        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"set_profile:{name}")])
-
-    markup = InlineKeyboardMarkup(keyboard)
-    if update.message:
-        await update.message.reply_html("\n".join(text_lines), reply_markup=markup)
-
-
 async def quotas_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Returns raw output of 'mgy quotas' from the device."""
     if not await check_auth_or_reject(update):
@@ -260,7 +244,8 @@ async def conversations_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     keyboard = []
     text_lines = ["📜 <b>Recent Conversations:</b>\n"]
-    active_cid = active_conversations.get(update.effective_chat.id)
+    sess = get_chat_session(update.effective_chat.id)
+    active_cid = sess.get("conversation_id")
 
     for c in convs:
         cid = c.get("conversation_id", "")
@@ -281,33 +266,100 @@ async def conversations_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Binds the chat session to a profile and optional conversation ID."""
     if not await check_auth_or_reject(update):
         return
 
     chat_id = update.effective_chat.id
-    active_conversations[chat_id] = None
+    args = context.args or []
+    if not args:
+        profiles = await runner.list_profiles()
+        prof_names = ", ".join(f"<code>{p['name']}</code>" for p in profiles) if profiles else "None found"
+        current = get_chat_session(chat_id)
+        cid_display = current.get("conversation_id") or "None (starts new conversation)"
+        text = (
+            f"ℹ️ <b>Usage:</b> <code>/new &lt;profile&gt; [conversation_id]</code>\n\n"
+            f"<b>Current Session:</b>\n"
+            f"• Profile: <code>{current['profile']}</code>\n"
+            f"• Conversation: <code>{cid_display}</code>\n\n"
+            f"<b>Available Profiles:</b>\n{prof_names}"
+        )
+        if update.message:
+            await update.message.reply_html(text)
+        return
+
+    profile = args[0]
+    conv_id = args[1] if len(args) > 1 else None
+
+    chat_sessions[chat_id] = {
+        "profile": profile,
+        "conversation_id": conv_id,
+    }
+
+    conv_info = f" with conversation <code>{conv_id}</code>" if conv_id else " (new conversation)"
     if update.message:
         await update.message.reply_html(
-            f"✨ Started fresh session on profile <b>{runner.active_profile}</b>.\nNext message will create a new conversation."
+            f"✨ Session configured for profile <b>{profile}</b>{conv_info}.\n"
+            f"Next message will execute under this profile."
         )
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancels ongoing task execution, optionally targeting a specific PID."""
     if not await check_auth_or_reject(update):
         return
 
-    code, msg = await runner.cancel_active_task()
+    target_pid: Optional[int] = None
+    if context.args:
+        try:
+            target_pid = int(context.args[0])
+        except ValueError:
+            pass
+
+    code, pid, msg = await runner.cancel_active_task(pid=target_pid)
+    pid_str = f" (PID: <code>{pid}</code>)" if pid else ""
+    if code == 0 and pid:
+        reply_text = f"🛑 <b>Cancelled task{pid_str}</b>"
+    else:
+        reply_text = f"🛑 <b>Cancel Request{pid_str}:</b> {html.escape(msg)}"
+
     if update.message:
-        await update.message.reply_html(f"🛑 <b>Cancel Request:</b> {html.escape(msg)}")
+        await update.message.reply_html(reply_text)
+
+
+async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kills a process by PID on the target device."""
+    if not await check_auth_or_reject(update):
+        return
+
+    if not context.args:
+        if update.message:
+            await update.message.reply_html("⚠️ <b>Usage:</b> <code>/kill &lt;pid&gt;</code>")
+        return
+
+    try:
+        pid = int(context.args[0])
+    except ValueError:
+        if update.message:
+            await update.message.reply_html("❌ PID must be an integer.")
+        return
+
+    success, msg = await runner.kill_process(pid)
+    emoji = "💀" if success else "❌"
+    if update.message:
+        await update.message.reply_html(f"{emoji} <b>Kill PID {pid}:</b> {html.escape(msg)}")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_auth_or_reject(update):
         return
 
+    chat_id = update.effective_chat.id
+    session = get_chat_session(chat_id)
     target_display = f"{SSH_USER}@{SSH_HOST}:{SSH_PORT}" if RUN_MODE == "ssh" else "Local Machine"
-    task_status = f"⚡ BUSY ({html.escape(runner.current_task or '')})" if runner.is_busy else "🟢 IDLE"
-    active_cid = active_conversations.get(update.effective_chat.id)
+    active_pid_str = f" (PID: <code>{runner.active_pid}</code>)" if runner.active_pid else ""
+    task_status = f"⚡ BUSY{active_pid_str} ({html.escape(runner.current_task or '')})" if runner.is_busy else "🟢 IDLE"
+    active_cid = session.get("conversation_id")
     cid_str = active_cid[:8] if active_cid else "Default / Latest"
 
     code, sys_info, _ = await runner.run_raw("uptime && free -h 2>/dev/null || uname -a", timeout=10)
@@ -315,7 +367,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = (
         f"📊 <b>System & Daemon Status:</b>\n\n"
         f"• <b>Target:</b> <code>{target_display}</code>\n"
-        f"• <b>Profile:</b> <code>{runner.active_profile}</code>\n"
+        f"• <b>Profile:</b> <code>{session['profile']}</code>\n"
         f"• <b>Active Conversation:</b> <code>{cid_str}</code>\n"
         f"• <b>Remote CWD:</b> <code>{runner.current_dir or '~'}</code>\n"
         f"• <b>Task State:</b> {task_status}\n\n"
@@ -363,21 +415,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data or ""
     chat_id = query.message.chat_id if query.message else None
 
-    if data.startswith("set_profile:"):
-        new_prof = data.split(":", 1)[1]
-        success = await runner.set_active_profile(new_prof)
-        if success:
-            await query.edit_message_text(
-                f"✅ Switched active profile to <b>{new_prof}</b>.",
-                parse_mode="HTML",
-            )
-        else:
-            await query.edit_message_text(f"❌ Profile {new_prof} not found.")
-
-    elif data.startswith("resume:"):
+    if data.startswith("resume:"):
         cid = data.split(":", 1)[1]
         if chat_id:
-            active_conversations[chat_id] = cid
+            sess = get_chat_session(chat_id)
+            sess["conversation_id"] = cid
         await query.edit_message_text(
             f"🔄 Pinned active conversation to <code>{cid[:8]}</code>.\nNext prompt will resume this conversation.",
             parse_mode="HTML",
@@ -385,15 +427,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif data == "new_session":
         if chat_id:
-            active_conversations[chat_id] = None
+            sess = get_chat_session(chat_id)
+            sess["conversation_id"] = None
+            prof = sess["profile"]
+        else:
+            prof = runner.default_profile or "default"
         await query.edit_message_text(
-            f"✨ Started fresh session on profile <b>{runner.active_profile}</b>.",
+            f"✨ Started fresh session on profile <b>{prof}</b>.",
             parse_mode="HTML",
         )
 
-    elif data == "cancel_task":
-        code, msg = await runner.cancel_active_task()
-        await query.edit_message_text(f"🛑 {msg}")
+    elif data.startswith("cancel_task"):
+        parts = data.split(":", 1)
+        target_pid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        code, pid, msg = await runner.cancel_active_task(pid=target_pid)
+        pid_str = f" (PID: <code>{pid}</code>)" if pid else ""
+        await query.edit_message_text(f"🛑 Cancelled task{pid_str}", parse_mode="HTML")
 
 
 async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -406,25 +455,31 @@ async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     chat_id = update.effective_chat.id
+    session = get_chat_session(chat_id)
+    profile = session["profile"]
 
     if runner.is_busy:
         if update.message:
-            cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Running Task", callback_data="cancel_task")]])
+            pid = runner.active_pid
+            btn_label = f"🛑 Cancel Running Task (PID: {pid})" if pid else "🛑 Cancel Running Task"
+            cb_data = f"cancel_task:{pid}" if pid else "cancel_task"
+            cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton(btn_label, callback_data=cb_data)]])
+            pid_info = f" (PID: <code>{pid}</code>)" if pid else ""
             await update.message.reply_html(
-                f"⏳ Runner is currently busy with: <code>{html.escape(runner.current_task or '')}</code>\n"
+                f"⏳ Runner is currently busy with{pid_info}: <code>{html.escape(runner.current_task or '')}</code>\n"
                 f"Please wait for it to complete or cancel it.",
                 reply_markup=cancel_btn,
             )
         return
 
-    conv_id = active_conversations.get(chat_id)
+    conv_id = session.get("conversation_id")
     continue_session = (conv_id is None)
 
     # Initial acknowledgement
     preview_prompt = prompt[:100] + ("..." if len(prompt) > 100 else "")
     cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_task")]])
     status_msg = await update.message.reply_html(
-        f"🚀 <b>Task dispatched to {runner.active_profile}...</b>\n"
+        f"🚀 <b>Task dispatched to {profile}...</b>\n"
         f"<i>Prompt:</i> <code>{html.escape(preview_prompt)}</code>\n\n"
         f"⏳ Processing in background...",
         reply_markup=cancel_btn,
@@ -434,9 +489,11 @@ async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     asyncio.create_task(
         _execute_and_reply(
             prompt=prompt,
+            profile=profile,
             conv_id=conv_id,
             continue_session=continue_session,
             status_msg=status_msg,
+            preview_prompt=preview_prompt,
             chat_id=chat_id,
             context=context,
         )
@@ -445,23 +502,42 @@ async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def _execute_and_reply(
     prompt: str,
+    profile: str,
     conv_id: Optional[str],
     continue_session: bool,
     status_msg,
+    preview_prompt: str,
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     try:
+        async def on_start_callback(pid: int):
+            try:
+                cancel_btn = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(f"🛑 Cancel Task (PID: {pid})", callback_data=f"cancel_task:{pid}")]]
+                )
+                await status_msg.edit_text(
+                    f"🚀 <b>Task dispatched to {profile} (PID: <code>{pid}</code>)...</b>\n"
+                    f"<i>Prompt:</i> <code>{html.escape(preview_prompt)}</code>\n\n"
+                    f"⏳ Processing in background...",
+                    parse_mode="HTML",
+                    reply_markup=cancel_btn,
+                )
+            except Exception:
+                pass
+
         code, out, err = await runner.dispatch_task(
             prompt=prompt,
+            profile=profile,
             conversation_id=conv_id,
             continue_session=continue_session,
+            on_start=on_start_callback,
         )
 
         # Remove "Processing in background..." indicator
         try:
             await status_msg.delete()
-        except:
+        except Exception:
             pass
 
         output = out.strip()
@@ -470,7 +546,7 @@ async def _execute_and_reply(
         if not output:
             output = "(Task completed with empty output)"
 
-        header = f"✅ <b>Task Completed (profile: {runner.active_profile})</b>:"
+        header = f"✅ <b>Task Completed (profile: {profile})</b>:"
         await send_chunked_code(
             chat_id=chat_id,
             bot=context.bot,
@@ -493,11 +569,11 @@ async def post_init(application) -> None:
         BotCommand("start", "Show status & help"),
         BotCommand("list", "Run 'mgy list' on device"),
         BotCommand("instances", "List active mgy / agy PIDs"),
-        BotCommand("profiles", "View and switch mgy profiles"),
         BotCommand("quotas", "View quota usage across profiles"),
         BotCommand("conversations", "List recent sessions"),
-        BotCommand("new", "Start a fresh session context"),
-        BotCommand("cancel", "Cancel current running task"),
+        BotCommand("new", "Bind session: /new <profile> [conv]"),
+        BotCommand("cancel", "Cancel running task: /cancel [pid]"),
+        BotCommand("kill", "Kill process by PID: /kill <pid>"),
         BotCommand("status", "View host & runner status"),
         BotCommand("cd", "Change remote directory"),
         BotCommand("pwd", "Print working directory"),
@@ -527,7 +603,7 @@ def main() -> None:
     print(f"Mode: {RUN_MODE.upper()}")
     if RUN_MODE == "ssh":
         print(f"SSH Target: {SSH_USER}@{SSH_HOST}:{SSH_PORT}")
-    print(f"Active Profile: {runner.active_profile}")
+    print(f"Default Profile: {runner.default_profile}")
 
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0)
     app = (
@@ -542,11 +618,11 @@ def main() -> None:
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("instances", instances_command))
-    app.add_handler(CommandHandler("profiles", profiles_command))
     app.add_handler(CommandHandler("quotas", quotas_command))
     app.add_handler(CommandHandler("conversations", conversations_command))
     app.add_handler(CommandHandler("new", new_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("kill", kill_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("cd", cd_command))
     app.add_handler(CommandHandler("pwd", pwd_command))

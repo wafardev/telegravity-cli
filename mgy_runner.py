@@ -2,7 +2,7 @@ import asyncio
 import os
 import re
 import shlex
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Callable, Any
 from config import (
     RUN_MODE,
     MGY_PROFILE,
@@ -18,9 +18,9 @@ from ssh_runner import SSHRunner
 class MgyRunner:
     """Manages executing multigravity (mgy) tasks and inspecting state."""
 
-    def __init__(self, mode: str = RUN_MODE, default_profile: str = MGY_PROFILE):
+    def __init__(self, mode: str = RUN_MODE, default_profile: Optional[str] = MGY_PROFILE):
         self.mode = mode
-        self.active_profile = default_profile
+        self.default_profile = default_profile
         self.ssh_runner = SSHRunner(
             user=SSH_USER,
             host=SSH_HOST,
@@ -30,12 +30,17 @@ class MgyRunner:
         ) if mode == "ssh" else None
         self.current_dir: Optional[str] = None
         self._active_proc: Optional[asyncio.subprocess.Process] = None
+        self._active_pid: Optional[int] = None
         self._is_busy: bool = False
         self._current_task_description: Optional[str] = None
 
     @property
     def is_busy(self) -> bool:
         return self._is_busy
+
+    @property
+    def active_pid(self) -> Optional[int]:
+        return self._active_pid
 
     @property
     def current_task(self) -> Optional[str]:
@@ -168,14 +173,33 @@ class MgyRunner:
         cleaned = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", raw)
         return cleaned.strip() or "No quota data returned."
 
-    async def set_active_profile(self, profile: str) -> bool:
-        """Sets the active profile for subsequent task dispatches."""
-        profiles = await self.list_profiles()
-        valid_names = [p["name"] for p in profiles]
-        if profile in valid_names or not valid_names:
-            self.active_profile = profile
-            return True
-        return False
+    async def kill_process(self, pid: int) -> Tuple[bool, str]:
+        """Kills a process by PID on the target device."""
+        if pid <= 1:
+            return False, "Invalid PID: cannot kill system processes."
+
+        # Check if process exists first
+        code, _, _ = await self.run_raw(f"kill -0 {pid} 2>/dev/null", timeout=5)
+        if code != 0:
+            return False, f"Process {pid} does not exist or has already terminated."
+
+        # Send SIGTERM first
+        await self.run_raw(f"kill -15 {pid} 2>/dev/null", timeout=5)
+        await asyncio.sleep(0.5)
+
+        # Check if process is gone
+        code2, _, _ = await self.run_raw(f"kill -0 {pid} 2>/dev/null", timeout=5)
+        if code2 != 0:
+            return True, f"Process {pid} terminated."
+
+        # Force kill with SIGKILL
+        await self.run_raw(f"kill -9 {pid} 2>/dev/null", timeout=5)
+        await asyncio.sleep(0.3)
+        code3, _, _ = await self.run_raw(f"kill -0 {pid} 2>/dev/null", timeout=5)
+        if code3 != 0:
+            return True, f"Process {pid} terminated (SIGKILL)."
+
+        return False, f"Failed to terminate process {pid} (permission denied or protected)."
 
     async def change_dir(self, target: str) -> Tuple[int, str]:
         """Changes the working directory."""
@@ -190,11 +214,13 @@ class MgyRunner:
     async def dispatch_task(
         self,
         prompt: str,
+        profile: str,
         conversation_id: Optional[str] = None,
         continue_session: bool = True,
+        on_start: Optional[Callable[[int], Any]] = None,
     ) -> Tuple[int, str, str]:
         """
-        Dispatches an agy task via mgy using the active profile.
+        Dispatches an agy task via mgy using the specified profile.
         Returns: (returncode, stdout, stderr)
         """
         if self._is_busy:
@@ -209,7 +235,7 @@ class MgyRunner:
 
             # Build mgy command
             # Auto-approves tool executions with --dangerously-skip-permissions for headless runs
-            args = [f"{self.mgy_bin} {self.active_profile}"]
+            args = [f"{self.mgy_bin} {profile}"]
 
             if conversation_id:
                 args.append(f"--conversation={shlex.quote(conversation_id)}")
@@ -221,35 +247,94 @@ class MgyRunner:
 
             full_cmd = " ".join(args)
 
-            if self.mode == "ssh":
-                # For SSH, pass through ssh runner
-                code, out, err = await self.run_raw(full_cmd, timeout=SSH_TIMEOUT)
-            else:
-                code, out, err = await self.run_raw(full_cmd, timeout=SSH_TIMEOUT)
+            if self.mode == "local":
+                cwd = os.path.expanduser(self.current_dir) if self.current_dir else None
+                try:
+                    proc = await asyncio.create_subprocess_shell(
+                        full_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=cwd,
+                    )
+                    self._active_proc = proc
+                    self._active_pid = proc.pid
 
-            return code, out, err
+                    if on_start and proc.pid:
+                        try:
+                            res = on_start(proc.pid)
+                            if asyncio.iscoroutine(res):
+                                asyncio.create_task(res)
+                        except Exception:
+                            pass
+
+                    stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=SSH_TIMEOUT)
+                    code = proc.returncode if proc.returncode is not None else 1
+                    return code, stdout_b.decode("utf-8", errors="replace"), stderr_b.decode("utf-8", errors="replace")
+                except asyncio.TimeoutError:
+                    if self._active_proc:
+                        try:
+                            self._active_proc.kill()
+                        except ProcessLookupError:
+                            pass
+                    return 124, "", f"Error: Command timed out after {SSH_TIMEOUT}s"
+                except Exception as e:
+                    return 1, "", f"Execution error: {str(e)}"
+                finally:
+                    self._active_proc = None
+                    self._active_pid = None
+            else:
+                # SSH mode
+                code, out, err = await self.run_raw(full_cmd, timeout=SSH_TIMEOUT)
+                return code, out, err
         finally:
             self._is_busy = False
             self._current_task_description = None
+            self._active_pid = None
 
-    async def cancel_active_task(self) -> Tuple[int, str]:
-        """Cancels any running mgy / agy turn."""
-        if self.mode == "ssh":
-            # Kill agy/mgy processes on remote host
-            kill_cmd = f"pkill -TERM -f 'mgy {self.active_profile}' || pkill -TERM -f 'agy'"
-            code, out, err = await self.ssh_runner._run_raw(kill_cmd)
+    async def cancel_active_task(self, pid: Optional[int] = None) -> Tuple[int, Optional[int], str]:
+        """
+        Cancels any running mgy / agy turn.
+        Returns: (returncode, pid, status_message)
+        """
+        target_pid = pid or self._active_pid
+
+        if not target_pid:
+            # Look up active mgy instance in process table
+            instances = await self.get_instances()
+            for inst in instances:
+                if inst.get("type") == "mgy":
+                    try:
+                        target_pid = int(inst["pid"])
+                        break
+                    except ValueError:
+                        pass
+
+        if target_pid:
+            success, msg = await self.kill_process(target_pid)
             self._is_busy = False
             self._current_task_description = None
-            return code, "Sent termination signal to remote agy/mgy process."
-        else:
+            self._active_pid = None
             if self._active_proc:
                 try:
-                    self._active_proc.terminate()
-                    await asyncio.sleep(0.5)
-                    if self._active_proc.returncode is None:
-                        self._active_proc.kill()
+                    self._active_proc.kill()
                 except ProcessLookupError:
                     pass
+                self._active_proc = None
+            return (0 if success else 1), target_pid, f"Cancelled task (PID: {target_pid})"
+
+        if self._active_proc:
+            proc_pid = self._active_proc.pid
+            try:
+                self._active_proc.kill()
+            except ProcessLookupError:
+                pass
             self._is_busy = False
             self._current_task_description = None
-            return 0, "Terminated local task."
+            self._active_proc = None
+            self._active_pid = None
+            return 0, proc_pid, f"Cancelled task (PID: {proc_pid})"
+
+        self._is_busy = False
+        self._current_task_description = None
+        self._active_pid = None
+        return 0, None, "No active running task found."
