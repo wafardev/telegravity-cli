@@ -383,6 +383,84 @@ async def peek_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_html(text, reply_markup=markup)
 
 
+async def _dispatch_to_pid_or_spawn(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    pid: int,
+    prompt: str,
+    profile: str,
+    cid: Optional[str],
+) -> None:
+    """Injects prompt directly into PID's interactive prompt if attached to a TTY, else falls back to background dispatch."""
+    preview_prompt = prompt[:100] + ("..." if len(prompt) > 100 else "")
+    has_tty = await runner.has_interactive_tty(pid)
+
+    if has_tty:
+        if update.message:
+            await update.message.reply_chat_action(ChatAction.TYPING)
+
+        success, msg = await runner.inject_input_to_pid(pid, prompt)
+        if success:
+            action_buttons = [
+                [
+                    InlineKeyboardButton(f"👁️ Peek PID {pid}", callback_data=f"peek:{pid}"),
+                    InlineKeyboardButton(f"🛑 Cancel Task", callback_data=f"cancel_task:{pid}"),
+                ]
+            ]
+            text = (
+                f"⌨️ <b>Injected prompt into PID <code>{pid}</code></b> (<b>{html.escape(profile)}</b>)\n"
+                f"<b>Prompt:</b> <code>{html.escape(preview_prompt)}</code>\n\n"
+                f"<i>Keystrokes typed directly into existing instance without opening a new one.</i>"
+            )
+            markup = InlineKeyboardMarkup(action_buttons)
+            if update.message:
+                await update.message.reply_html(text, reply_markup=markup)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
+        else:
+            err_text = f"❌ <b>Failed to type into PID <code>{pid}</code>:</b> {html.escape(msg)}"
+            if update.message:
+                await update.message.reply_html(err_text)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=err_text, parse_mode="HTML")
+    else:
+        # Fallback for non-interactive / headless PID: dispatch background task
+        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton(f"🛑 Cancel Task (PID: {pid})", callback_data=f"cancel_task:{pid}")]])
+        msg_obj = update.message if update.message else None
+        if msg_obj:
+            status_msg = await msg_obj.reply_html(
+                f"🚀 <b>Task dispatched to {profile} (Target PID: <code>{pid}</code>)...</b>\n"
+                f"<i>Prompt:</i> <code>{html.escape(preview_prompt)}</code>\n\n"
+                f"⏳ Processing in background...",
+                reply_markup=cancel_btn,
+            )
+        else:
+            status_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🚀 <b>Task dispatched to {profile} (Target PID: <code>{pid}</code>)...</b>\n"
+                    f"<i>Prompt:</i> <code>{html.escape(preview_prompt)}</code>\n\n"
+                    f"⏳ Processing in background..."
+                ),
+                parse_mode="HTML",
+                reply_markup=cancel_btn,
+            )
+
+        asyncio.create_task(
+            _execute_and_reply(
+                prompt=prompt,
+                profile=profile,
+                conv_id=cid,
+                continue_session=(cid is None),
+                status_msg=status_msg,
+                preview_prompt=preview_prompt,
+                chat_id=chat_id,
+                context=context,
+            )
+        )
+
+
 async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Runs a prompt on a specific instance: /run <pid> [prompt]"""
     if not await check_auth_or_reject(update):
@@ -396,6 +474,26 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if update.message:
                 await update.message.reply_html(
                     "⚠️ <b>Usage:</b> <code>/run &lt;pid&gt; [prompt]</code>\n<i>No active mgy or agy instances running.</i>"
+                )
+            return
+
+        if len(instances) == 1:
+            inst = instances[0]
+            pid = int(inst["pid"])
+            prof = inst.get("profile", runner.default_profile or "default")
+            cid = inst.get("conversation_id")
+            context.user_data["pending_run"] = {
+                "pid": pid,
+                "profile": prof,
+                "conversation_id": cid,
+            }
+            cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Prompt", callback_data="cancel_pending_run")]])
+            cid_disp = f" (conv: <code>{cid[:8]}</code>)" if cid else ""
+            if update.message:
+                await update.message.reply_html(
+                    f"🚀 <b>Run on PID <code>{pid}</code></b> (profile: <b>{prof}</b>{cid_disp})\n\n"
+                    f"<i>Send the prompt to insert into this instance:</i>",
+                    reply_markup=cancel_btn,
                 )
             return
 
@@ -431,25 +529,14 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "profile": prof,
             "conversation_id": cid,
         }
-        preview_prompt = prompt[:100] + ("..." if len(prompt) > 100 else "")
-        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data=f"cancel_task:{pid}")]])
-        status_msg = await update.message.reply_html(
-            f"🚀 <b>Task dispatched to {prof} (Target PID: <code>{pid}</code>)...</b>\n"
-            f"<i>Prompt:</i> <code>{html.escape(preview_prompt)}</code>\n\n"
-            f"⏳ Processing in background...",
-            reply_markup=cancel_btn,
-        )
-        asyncio.create_task(
-            _execute_and_reply(
-                prompt=prompt,
-                profile=prof,
-                conv_id=cid,
-                continue_session=(cid is None),
-                status_msg=status_msg,
-                preview_prompt=preview_prompt,
-                chat_id=chat_id,
-                context=context,
-            )
+        await _dispatch_to_pid_or_spawn(
+            update=update,
+            context=context,
+            chat_id=chat_id,
+            pid=pid,
+            prompt=prompt,
+            profile=prof,
+            cid=cid,
         )
     else:
         context.user_data["pending_run"] = {
@@ -462,7 +549,7 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if update.message:
             await update.message.reply_html(
                 f"🚀 <b>Run on PID <code>{pid}</code></b> (profile: <b>{prof}</b>{cid_disp})\n\n"
-                f"<i>Send the prompt to insert:</i>",
+                f"<i>Send the prompt to insert into this instance:</i>",
                 reply_markup=cancel_btn,
             )
 
@@ -780,6 +867,17 @@ async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             "profile": profile,
             "conversation_id": conv_id,
         }
+        if target_pid:
+            await _dispatch_to_pid_or_spawn(
+                update=update,
+                context=context,
+                chat_id=chat_id,
+                pid=target_pid,
+                prompt=prompt,
+                profile=profile,
+                cid=conv_id,
+            )
+            return
         dispatch_label = f"Task dispatched to {profile} (Target PID: <code>{target_pid}</code>)..."
     else:
         session = get_chat_session(chat_id)

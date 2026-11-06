@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import re
@@ -345,6 +346,88 @@ print("OK")
         cleaned = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", raw)
         return cleaned.strip() or "No quota data returned."
 
+    async def has_interactive_tty(self, pid: int) -> bool:
+        """Checks if a process (or any of its child processes) is attached to an interactive terminal."""
+        if pid <= 0:
+            return False
+        code, out, _ = await self.run_raw(f"ps -p {pid} -o tty=", timeout=5)
+        if code == 0:
+            tty = out.strip()
+            if tty and tty != "?":
+                return True
+
+        # Check child processes
+        code2, out2, _ = await self.run_raw(f"pgrep -P {pid} 2>/dev/null", timeout=5)
+        if code2 == 0 and out2.strip():
+            for c_pid in out2.strip().split():
+                c_code, c_out, _ = await self.run_raw(f"ps -p {c_pid} -o tty=", timeout=5)
+                if c_code == 0:
+                    c_tty = c_out.strip()
+                    if c_tty and c_tty != "?":
+                        return True
+        return False
+
+    async def inject_input_to_pid(self, pid: int, text: str) -> Tuple[bool, str]:
+        """
+        Injects input text (keystrokes) directly into the interactive terminal prompt of PID.
+        Uses GDB + TIOCSTI to push characters into the TTY input queue without spawning new processes.
+        """
+        if pid <= 0:
+            return False, "Invalid PID."
+
+        # Ensure text ends with carriage return (\r) for terminal prompt submission
+        if not text.endswith("\r") and not text.endswith("\n"):
+            text += "\r"
+        elif text.endswith("\n"):
+            text = text[:-1] + "\r"
+
+        has_tty = await self.has_interactive_tty(pid)
+        if not has_tty:
+            return False, f"Process {pid} is not attached to an interactive terminal."
+
+        b64_data = base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+        gdb_script = """import gdb, os, base64, sys
+try:
+    b64_data = os.environ.get("INJECT_DATA", "")
+    raw = base64.b64decode(b64_data)
+    inf = gdb.selected_inferior()
+    sp = int(gdb.parse_and_eval("$sp"))
+    scratch = sp - 128
+    for b in raw:
+        inf.write_memory(scratch, bytes([b]), 1)
+        res = int(gdb.parse_and_eval(f"(int)ioctl(0, 0x5412, {scratch})"))
+        if res != 0:
+            sys.exit(1)
+    sys.exit(0)
+except Exception as e:
+    sys.stderr.write(str(e) + chr(10))
+    sys.exit(1)
+"""
+        b64_script = base64.b64encode(gdb_script.strip().encode("utf-8")).decode("ascii")
+
+        runner_script = f"""import base64, tempfile, subprocess, os, sys
+code = base64.b64decode('{b64_script}')
+f = tempfile.NamedTemporaryFile('wb', suffix='.py', delete=False)
+f.write(code)
+f.close()
+env = os.environ.copy()
+env['INJECT_DATA'] = '{b64_data}'
+res = subprocess.run(['gdb', '-p', '{pid}', '-batch', '-x', f.name], env=env, capture_output=True)
+os.unlink(f.name)
+if res.returncode != 0:
+    sys.stderr.write(res.stderr.decode('utf-8', errors='replace'))
+sys.exit(res.returncode)
+"""
+        b64_runner = base64.b64encode(runner_script.strip().encode("utf-8")).decode("ascii")
+
+        cmd = f"python3 -c \"import base64; exec(base64.b64decode('{b64_runner}'))\""
+        code, out, err = await self.run_raw(cmd, timeout=20)
+        if code == 0:
+            return True, f"Successfully typed prompt into PID {pid}."
+        err_msg = err.strip() or out.strip() or f"gdb exited with code {code}"
+        return False, err_msg
+
     async def kill_process(self, pid: int) -> Tuple[bool, str]:
         """Kills a process by PID on the target device."""
         if pid <= 1:
@@ -500,17 +583,30 @@ print("OK")
                         pass
 
         if target_pid:
-            success, msg = await self.kill_process(target_pid)
-            self._is_busy = False
-            self._current_task_description = None
-            self._active_pid = None
-            if self._active_proc:
-                try:
-                    self._active_proc.kill()
-                except ProcessLookupError:
-                    pass
-                self._active_proc = None
-            return (0 if success else 1), target_pid, f"Cancelled task (PID: {target_pid})"
+            has_tty = await self.has_interactive_tty(target_pid)
+            if has_tty:
+                # For interactive terminal sessions, send SIGINT (Ctrl+C) to cancel current turn without killing shell
+                await self.run_raw(f"kill -2 {target_pid} 2>/dev/null", timeout=5)
+                code_c, out_c, _ = await self.run_raw(f"pgrep -P {target_pid} 2>/dev/null", timeout=5)
+                if code_c == 0 and out_c.strip():
+                    for c_pid in out_c.strip().split():
+                        await self.run_raw(f"kill -2 {c_pid} 2>/dev/null", timeout=5)
+                self._is_busy = False
+                self._current_task_description = None
+                self._active_pid = None
+                return 0, target_pid, f"Sent cancel signal (Ctrl+C) to PID {target_pid}"
+            else:
+                success, msg = await self.kill_process(target_pid)
+                self._is_busy = False
+                self._current_task_description = None
+                self._active_pid = None
+                if self._active_proc:
+                    try:
+                        self._active_proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    self._active_proc = None
+                return (0 if success else 1), target_pid, f"Cancelled task (PID: {target_pid})"
 
         if self._active_proc:
             proc_pid = self._active_proc.pid
