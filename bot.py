@@ -188,8 +188,42 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+def format_instances_view(instances: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    """Formats the instances list with status indicators and interactive buttons."""
+    if not instances:
+        text = "🔍 <b>Active Instances:</b>\n\n<i>No running mgy or agy instances found on target device.</i>"
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="refresh_instances")]]
+        return text, InlineKeyboardMarkup(keyboard)
+
+    lines = ["🔍 <b>Active Instances:</b>\n"]
+    keyboard = []
+
+    for inst in instances:
+        pid = inst["pid"]
+        cmd = inst["cmd"]
+        is_running = inst.get("is_running", False)
+
+        if is_running:
+            status_text = "🟡 <b>Running</b> <i>(in a prompt)</i>"
+            btn_text = f"🟡 Running (PID: {pid})"
+            btn_cb = f"cancel_task:{pid}"
+        else:
+            status_text = "🟢 <b>Ready</b> <i>(waiting for a prompt)</i>"
+            btn_text = f"🟢 Ready (PID: {pid})"
+            btn_cb = f"instance_ready:{pid}"
+
+        lines.append(
+            f"• <b>PID:</b> <code>{pid}</code> — {status_text}\n"
+            f"  <code>{html.escape(cmd)}</code>\n"
+        )
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=btn_cb)])
+
+    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_instances")])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
 async def instances_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Returns PIDs and command lines of active mgy/agy instances on the target device."""
+    """Returns PIDs, commands, and live status (ready/running) of active mgy/agy instances."""
     if not await check_auth_or_reject(update):
         return
 
@@ -197,19 +231,10 @@ async def instances_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_chat_action(ChatAction.TYPING)
 
     instances = await runner.get_instances()
-    if not instances:
-        if update.message:
-            await update.message.reply_html(
-                "🔍 <b>Active Instances:</b>\n<i>No running mgy or agy instances found on target device.</i>"
-            )
-        return
-
-    lines = ["🔍 <b>Active Instances:</b>\n"]
-    for inst in instances:
-        lines.append(f"• <b>PID:</b> <code>{inst['pid']}</code>\n  <code>{html.escape(inst['cmd'])}</code>")
+    text, markup = format_instances_view(instances)
 
     if update.message:
-        await update.message.reply_html("\n".join(lines))
+        await update.message.reply_html(text, reply_markup=markup)
 
 
 async def quotas_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -437,12 +462,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="HTML",
         )
 
+    elif data.startswith("instance_ready:"):
+        pid = data.split(":", 1)[1]
+        await query.answer(f"🟢 Instance {pid} is ready (waiting for a prompt).", show_alert=True)
+
+    elif data == "refresh_instances":
+        instances = await runner.get_instances()
+        text, markup = format_instances_view(instances)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        await query.answer("Refreshed instances!")
+
     elif data.startswith("cancel_task"):
         parts = data.split(":", 1)
         target_pid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
         code, pid, msg = await runner.cancel_active_task(pid=target_pid)
         pid_str = f" (PID: <code>{pid}</code>)" if pid else ""
-        await query.edit_message_text(f"🛑 Cancelled task{pid_str}", parse_mode="HTML")
+
+        # If clicked from instances view, refresh the instances view directly
+        orig_text = query.message.text or "" if query.message else ""
+        if "Active Instances" in orig_text:
+            await asyncio.sleep(0.5)
+            instances = await runner.get_instances()
+            text, markup = format_instances_view(instances)
+            try:
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            except Exception:
+                await query.edit_message_text(f"🛑 Cancelled task{pid_str}", parse_mode="HTML")
+        else:
+            await query.edit_message_text(f"🛑 Cancelled task{pid_str}", parse_mode="HTML")
 
 
 async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

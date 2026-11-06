@@ -107,7 +107,7 @@ flowchart TD
 | :--------------------------- | :------------------------------------------------------------- |
 | **Any text message**         | Dispatches a task prompt to `mgy` using the session profile    |
 | `/list`                      | Output raw `mgy list` from the target device                   |
-| `/instances`                 | List running `mgy` and `agy` process PIDs and commands         |
+| `/instances`                 | List running instances with 🟢 Ready (waiting) / 🟡 Running (in prompt) buttons |
 | `/quotas`                    | Output raw `mgy quotas` from the target device                 |
 | `/conversations`             | View recent sessions with live status (`⚡ RUNNING` / `🟢 IDLE`) |
 | `/new <profile> [conv]`      | Bind chat session to a profile and optional conversation ID    |

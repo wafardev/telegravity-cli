@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import shlex
@@ -97,44 +98,57 @@ class MgyRunner:
             return out.strip()
         return (out + "\n" + err).strip() or "No profiles found or error running mgy list."
 
-    async def get_instances(self) -> List[Dict[str, str]]:
+    async def get_instances(self) -> List[Dict[str, Any]]:
         """
         Returns active mgy and agy instances running on the target device.
-        Each entry contains: {'pid': str, 'cmd': str, 'type': 'mgy'|'agy'}
+        Each entry contains: {
+            'pid': str,
+            'cmd': str,
+            'type': 'mgy' | 'agy',
+            'is_running': bool,  # True = in a prompt (running), False = waiting for a prompt (ready)
+            'status': str,       # 'running' or 'ready'
+            'profile': Optional[str],
+            'conversation_id': Optional[str],
+        }
         """
         code, out, _ = await self.run_raw("ps -eo pid,ppid,args", timeout=15)
         if code != 0 or not out:
             return []
 
         lines = out.splitlines()
-        instances: List[Dict[str, str]] = []
+        instances: List[Dict[str, Any]] = []
         mgy_pids = set()
+        children_map: Dict[str, List[Tuple[str, str]]] = {}
 
-        # First pass: find mgy processes
+        raw_procs = []
         for line in lines[1:]:
             parts = line.strip().split(None, 2)
             if len(parts) < 3:
                 continue
             pid, ppid, args = parts[0], parts[1], parts[2]
+            raw_procs.append((pid, ppid, args))
+            children_map.setdefault(ppid, []).append((pid, args))
 
-            # Ignore daemon, grep, and editor processes
+        # First pass: find mgy processes
+        for pid, ppid, args in raw_procs:
             if "telegravity" in args or "grep" in args:
                 continue
 
-            # Match mgy invocation (e.g. bash .../mgy <profile> ..., mgy <profile> ...)
             match = re.search(r"(?:^|[\s/])mgy(?:\.sh|\.py)?(?:\s+(.*))?$", args)
             if match:
                 mgy_args = (match.group(1) or "").strip()
                 cmd_clean = f"mgy {mgy_args}".strip()
-                instances.append({"pid": pid, "cmd": cmd_clean, "type": "mgy"})
+                instances.append({
+                    "pid": pid,
+                    "ppid": ppid,
+                    "cmd": cmd_clean,
+                    "type": "mgy",
+                    "args": mgy_args,
+                })
                 mgy_pids.add(pid)
 
         # Second pass: find standalone agy processes whose parent is not mgy
-        for line in lines[1:]:
-            parts = line.strip().split(None, 2)
-            if len(parts) < 3:
-                continue
-            pid, ppid, args = parts[0], parts[1], parts[2]
+        for pid, ppid, args in raw_procs:
             if "telegravity" in args or "grep" in args:
                 continue
             if ppid in mgy_pids:
@@ -144,7 +158,97 @@ class MgyRunner:
             if match:
                 agy_args = (match.group(1) or "").strip()
                 cmd_clean = f"agy {agy_args}".strip()
-                instances.append({"pid": pid, "cmd": cmd_clean, "type": "agy"})
+                instances.append({
+                    "pid": pid,
+                    "ppid": ppid,
+                    "cmd": cmd_clean,
+                    "type": "agy",
+                    "args": agy_args,
+                })
+
+        if not instances:
+            return []
+
+        # Query active conversations in SQLite database
+        active_conv_query = """
+import sqlite3, json, os
+db = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+if not os.path.exists(db):
+    print("[]")
+    exit(0)
+conn = sqlite3.connect(db)
+conn.row_factory = sqlite3.Row
+rows = conn.execute("SELECT conversation_id, title, not_fully_idle FROM conversation_summaries WHERE not_fully_idle = 1").fetchall()
+print(json.dumps([dict(r) for r in rows]))
+"""
+        code2, out2, _ = await self.run_raw(f"python3 -c '{active_conv_query.strip()}'", timeout=5)
+        active_convs = []
+        if code2 == 0 and out2.strip():
+            try:
+                active_convs = json.loads(out2.strip())
+            except Exception:
+                pass
+
+        active_conv_ids = {c["conversation_id"] for c in active_convs if "conversation_id" in c}
+
+        # Check running state for each instance
+        for inst in instances:
+            inst_pid = inst["pid"]
+            args_str = inst.get("args", "")
+
+            # Extract conversation_id if present
+            conv_match = re.search(r"--conversation[=\s]+([^\s]+)", args_str)
+            conv_id = conv_match.group(1) if conv_match else None
+            inst["conversation_id"] = conv_id
+
+            # Extract profile name
+            if inst["type"] == "mgy":
+                prof_tokens = [t for t in args_str.split() if not t.startswith("-")]
+                inst["profile"] = prof_tokens[0] if prof_tokens else (self.default_profile or "default")
+            else:
+                inst["profile"] = self.default_profile or "default"
+
+            is_running = False
+
+            # Check 1: runner is currently busy with this PID or its descendants
+            if self._is_busy and self._active_pid:
+                if str(self._active_pid) == inst_pid:
+                    is_running = True
+                else:
+                    stack = [inst_pid]
+                    while stack:
+                        p = stack.pop()
+                        for c_pid, _ in children_map.get(p, []):
+                            if c_pid == str(self._active_pid):
+                                is_running = True
+                                break
+                            stack.append(c_pid)
+                        if is_running:
+                            break
+
+            # Check 2: specific conversation is marked not_fully_idle
+            if not is_running and conv_id and conv_id in active_conv_ids:
+                is_running = True
+
+            # Check 3: any conversation is not_fully_idle and only 1 instance exists
+            if not is_running and active_conv_ids and len(instances) == 1:
+                is_running = True
+
+            # Check 4: instance has active tool child processes running under agy
+            if not is_running:
+                stack = [inst_pid]
+                while stack:
+                    p = stack.pop()
+                    for c_pid, c_args in children_map.get(p, []):
+                        if not re.search(r"(?:^|[\s/])(mgy|agy)(?:\s|$)", c_args):
+                            is_running = True
+                            break
+                        stack.append(c_pid)
+                    if is_running:
+                        break
+
+            inst["is_running"] = is_running
+            inst["status"] = "running" if is_running else "ready"
 
         return instances
 
