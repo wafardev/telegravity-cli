@@ -12,6 +12,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
 )
 from telegram.request import HTTPXRequest
 from telegram.constants import ChatAction
@@ -487,7 +488,27 @@ async def _execute_and_reply(
 
 
 async def post_init(application) -> None:
-    """Called after application is initialized. Starts the background session monitor."""
+    """Called after application is initialized. Sets up commands and starts session monitor."""
+    commands = [
+        BotCommand("start", "Show status & help"),
+        BotCommand("list", "Run 'mgy list' on device"),
+        BotCommand("instances", "List active mgy / agy PIDs"),
+        BotCommand("profiles", "View and switch mgy profiles"),
+        BotCommand("quotas", "View quota usage across profiles"),
+        BotCommand("conversations", "List recent sessions"),
+        BotCommand("new", "Start a fresh session context"),
+        BotCommand("cancel", "Cancel current running task"),
+        BotCommand("status", "View host & runner status"),
+        BotCommand("cd", "Change remote directory"),
+        BotCommand("pwd", "Print working directory"),
+        BotCommand("help", "Show help and command list"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+        logger.info("Bot commands registered successfully with Telegram.")
+    except Exception as e:
+        logger.warning("Could not register bot commands with Telegram: %s", e)
+
     async def _on_complete(conv_info, output_text):
         await on_external_task_completed(conv_info, output_text, application)
 
