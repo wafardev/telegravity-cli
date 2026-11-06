@@ -107,7 +107,7 @@ flowchart TD
 | :--------------------------- | :------------------------------------------------------------- |
 | **Any text message**         | Dispatches a task prompt to `mgy` using the session profile    |
 | `/accounts`                  | List all mgy accounts on the device                            |
-| `/instances`                 | List running instances with 🟢 Ready / 🟡 Running & Peek buttons|
+| `/instances`                 | List running instances with 🟢 Ready / 🟡 Running / 🔴 Depleted & Peek buttons|
 | `/quotas`                    | Get all mgy quotas per account                                 |
 | `/peek <pid>`                | Get latest answer or live stream output from instance PID      |
 | `/new <profile> [conv]`      | Bind chat session to a profile and optional conversation ID    |

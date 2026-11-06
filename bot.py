@@ -210,11 +210,18 @@ def format_instances_view(instances: list[dict]) -> tuple[str, InlineKeyboardMar
         pid = inst["pid"]
         cmd = inst["cmd"]
         is_running = inst.get("is_running", False)
+        is_depleted = inst.get("is_quota_depleted", False) or inst.get("status") == "quota_depleted"
+        reset_time = inst.get("reset_time")
 
         if is_running:
             status_text = "🟡 <b>Running</b> <i>(in a prompt)</i>"
             btn_text = f"🟡 Running (PID: {pid})"
             btn_cb = f"cancel_task:{pid}"
+        elif is_depleted:
+            reset_desc = f" <i>(resets in {reset_time})</i>" if reset_time else ""
+            status_text = f"🔴 <b>Quota Depleted</b>{reset_desc}"
+            btn_text = f"🔴 Quota Depleted ({pid})"
+            btn_cb = f"quota_info:{pid}"
         else:
             status_text = "🟢 <b>Ready</b> <i>(waiting for a prompt)</i>"
             btn_text = f"🟢 Ready (PID: {pid})"
@@ -274,11 +281,18 @@ def format_peek_view(info: dict) -> tuple[str, InlineKeyboardMarkup]:
         return msg, InlineKeyboardMarkup(keyboard)
 
     is_running = info.get("is_running", False)
-    status_badge = "🟡 <b>Running / Streaming</b> <i>(in a prompt)</i>" if is_running else "🟢 <b>Ready / Idle</b> <i>(waiting for prompt)</i>"
+    content = info.get("content", "")
+    is_depleted = info.get("is_quota_depleted", False) or ("Individual quota reached" in content) or ("RESOURCE_EXHAUSTED" in content)
+
+    if is_running:
+        status_badge = "🟡 <b>Running / Streaming</b> <i>(in a prompt)</i>"
+    elif is_depleted:
+        status_badge = "🔴 <b>Quota Depleted</b> <i>(stopped: quota reached)</i>"
+    else:
+        status_badge = "🟢 <b>Ready / Idle</b> <i>(waiting for prompt)</i>"
     cmd = info.get("cmd", "")
     conv_id = info.get("conversation_id")
     conv_title = info.get("conversation_title")
-    content = info.get("content", "")
 
     header_lines = [
         f"👁️ <b>Instance Peek (PID: <code>{pid}</code>)</b>",
@@ -544,6 +558,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data.startswith("instance_ready:"):
         pid = data.split(":", 1)[1]
         await query.answer(f"🟢 Instance {pid} is ready (waiting for a prompt).", show_alert=True)
+
+    elif data.startswith("quota_info:"):
+        pid = data.split(":", 1)[1]
+        instances = await runner.get_instances()
+        target = next((i for i in instances if str(i.get("pid")) == str(pid)), None)
+        rst = target.get("reset_time") if target else None
+        rst_str = f" Resets in {rst}." if rst else ""
+        await query.answer(f"🔴 Instance {pid} stopped: Quota reached.{rst_str}\nSwitch accounts with /new or check /quotas.", show_alert=True)
 
     elif data.startswith("peek:"):
         pid_str = data.split(":", 1)[1]

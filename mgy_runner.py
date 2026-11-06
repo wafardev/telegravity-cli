@@ -249,9 +249,76 @@ print(json.dumps([dict(r) for r in rows]))
                         break
 
             inst["is_running"] = is_running
-            inst["status"] = "running" if is_running else "ready"
+
+            # If not running, check if it stopped due to depleted quota
+            is_quota_depleted = False
+            reset_time = None
+            if not is_running:
+                is_quota_depleted, reset_time = await self.check_pid_quota_depleted(int(inst_pid))
+
+            inst["is_quota_depleted"] = is_quota_depleted
+            inst["reset_time"] = reset_time
+
+            if is_running:
+                inst["status"] = "running"
+            elif is_quota_depleted:
+                inst["status"] = "quota_depleted"
+            else:
+                inst["status"] = "ready"
 
         return instances
+
+    async def check_pid_quota_depleted(self, pid: int) -> Tuple[bool, Optional[str]]:
+        """Checks if the instance with PID stopped due to depleted quota."""
+        check_script = f"""
+import os, glob, re
+
+pid = {pid}
+child_pids = [str(pid)]
+try:
+    with open(f"/proc/{{pid}}/task/{{pid}}/children", "r") as f:
+        child_pids.extend(f.read().split())
+except Exception:
+    pass
+
+logfile = None
+for p in child_pids:
+    for fd in (1, 2):
+        link = f"/proc/{{p}}/fd/{{fd}}"
+        if os.path.exists(link):
+            try:
+                target = os.readlink(link)
+                if "/log/cli-" in target:
+                    logfile = target
+                    break
+            except Exception:
+                pass
+    if logfile:
+        break
+
+if not logfile:
+    files = sorted(glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/log/cli-*.log")), key=os.path.getmtime, reverse=True)
+    logfile = files[0] if files else None
+
+if logfile and os.path.exists(logfile):
+    try:
+        with open(logfile, "r", errors="replace") as f:
+            lines = f.readlines()
+        for line in reversed(lines[-80:]):
+            if "RESOURCE_EXHAUSTED" in line or "quota reached" in line:
+                m = re.search(r"Resets in ([0-9a-zA-Z]+)", line)
+                res_val = m.group(1) if m else "soon"
+                print(f"DEPLETED:{{res_val}}")
+                exit(0)
+    except Exception:
+        pass
+print("OK")
+"""
+        code, out, _ = await self.run_raw(f"python3 -c '{check_script.strip()}'", timeout=5)
+        if code == 0 and out.strip().startswith("DEPLETED:"):
+            res_str = out.strip().split(":", 1)[1]
+            return True, res_str
+        return False, None
 
     async def list_profiles(self) -> List[Dict[str, str]]:
         """Lists available multigravity profiles."""
@@ -725,11 +792,14 @@ print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_tit
             if is_running and res_content:
                 res_content = self._extract_last_sentences(res_content, max_sentences=5, max_chars=1200)
 
+            is_depleted = (res.get("transcript_status") == "quota_exhausted") or ("Individual quota reached" in res_content)
+
             return {
                 "pid": pid,
                 "found": True,
                 "cmd": cmd,
                 "is_running": is_running,
+                "is_quota_depleted": is_depleted,
                 "source": "transcript",
                 "conversation_id": res.get("conversation_id"),
                 "conversation_title": res.get("conversation_title"),
