@@ -157,14 +157,24 @@ python bot.py
 
 ### 4. Running as a Permanent 24/7 Service on Remote Device (Optional)
 
-If running the daemon directly on the remote device:
-1. Copy `telegravity.service` to `/etc/systemd/system/`:
-   ```bash
-   sudo cp telegravity.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now telegravity.service
-   ```
-2. Check logs:
-   ```bash
-   journalctl -u telegravity.service -f
-   ```
+If running the daemon directly on your target Linux machine:
+
+#### Option A: User Service (Recommended, No Sudo Required)
+```bash
+# Keep service running after logout and across reboots:
+loginctl enable-linger $USER
+
+mkdir -p ~/.config/systemd/user
+cp telegravity.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now telegravity.service
+systemctl --user status telegravity.service
+```
+
+#### Option B: System Service (With Sudo)
+```bash
+sudo cp telegravity.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegravity.service
+sudo systemctl status telegravity.service
+```
