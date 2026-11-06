@@ -106,10 +106,10 @@ flowchart TD
 | Command                      | Description                                                    |
 | :--------------------------- | :------------------------------------------------------------- |
 | **Any text message**         | Dispatches a task prompt to `mgy` using the session profile    |
-| `/list`                      | Output raw `mgy list` from the target device                   |
-| `/instances`                 | List running instances with 🟢 Ready (waiting) / 🟡 Running (in prompt) buttons |
-| `/quotas`                    | Output raw `mgy quotas` from the target device                 |
-| `/conversations`             | View recent sessions with live status (`⚡ RUNNING` / `🟢 IDLE`) |
+| `/accounts`                  | List all mgy accounts on the device                            |
+| `/instances`                 | List running instances with 🟢 Ready / 🟡 Running & Peek buttons|
+| `/quotas`                    | Get all mgy quotas per account                                 |
+| `/peek <pid>`                | Get latest answer or live stream output from instance PID      |
 | `/new <profile> [conv]`      | Bind chat session to a profile and optional conversation ID    |
 | `/cancel [pid]`              | Abort/interrupt running task (shows PID and supports cancel by PID) |
 | `/kill <pid>`                | Terminate any process by PID on the target device              |

@@ -157,10 +157,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"<b>Remote CWD:</b> <code>{cwd}</code>\n\n"
         f"<b>Usage:</b>\n"
         f"• <b>Send any message</b> to dispatch an agy task via mgy.\n"
-        f"• <code>/list</code> - Run 'mgy list' on the device.\n"
+        f"• <code>/accounts</code> - List all mgy accounts on the device.\n"
         f"• <code>/instances</code> - List running mgy & agy process PIDs.\n"
-        f"• <code>/quotas</code> - Run 'mgy quotas' on the device.\n"
-        f"• <code>/conversations</code> - List recent sessions.\n"
+        f"• <code>/quotas</code> - Get all mgy quotas per account.\n"
+        f"• <code>/peek &lt;pid&gt;</code> - Get latest answer or stream from instance.\n"
         f"• <code>/new &lt;profile&gt; [conv]</code> - Bind session to profile & conversation.\n"
         f"• <code>/cancel [pid]</code> - Cancel running task (appends PID).\n"
         f"• <code>/kill &lt;pid&gt;</code> - Kill any process by PID.\n"
@@ -171,8 +171,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_html(welcome_text)
 
 
-async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Returns raw output of 'mgy list' from the device."""
+async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Returns raw output of 'mgy list' from the device (lists accounts)."""
     if not await check_auth_or_reject(update):
         return
 
@@ -183,8 +183,8 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await send_chunked_code(
         chat_id=update.effective_chat.id,
         bot=context.bot,
-        text=output or "(no output from mgy list)",
-        header="📋 <b>mgy list:</b>",
+        text=output or "(no accounts found from mgy list)",
+        header="👥 <b>mgy accounts:</b>",
     )
 
 
@@ -216,7 +216,10 @@ def format_instances_view(instances: list[dict]) -> tuple[str, InlineKeyboardMar
             f"• <b>PID:</b> <code>{pid}</code> — {status_text}\n"
             f"  <code>{html.escape(cmd)}</code>\n"
         )
-        keyboard.append([InlineKeyboardButton(btn_text, callback_data=btn_cb)])
+        keyboard.append([
+            InlineKeyboardButton(btn_text, callback_data=btn_cb),
+            InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
+        ])
 
     keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_instances")])
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
@@ -254,40 +257,99 @@ async def quotas_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
-async def conversations_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def format_peek_view(info: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """Formats the peek result with status, session info, and latest answer or stream."""
+    pid = info.get("pid")
+    if not info.get("found"):
+        msg = f"❌ <b>Process {pid} not found:</b> {html.escape(info.get('error', 'Instance terminated or not running.'))}"
+        keyboard = [[InlineKeyboardButton("📋 View Instances", callback_data="refresh_instances")]]
+        return msg, InlineKeyboardMarkup(keyboard)
+
+    is_running = info.get("is_running", False)
+    status_badge = "🟡 <b>Running / Streaming</b> <i>(in a prompt)</i>" if is_running else "🟢 <b>Ready / Idle</b> <i>(waiting for prompt)</i>"
+    cmd = info.get("cmd", "")
+    conv_id = info.get("conversation_id")
+    conv_title = info.get("conversation_title")
+    content = info.get("content", "")
+
+    header_lines = [
+        f"👁️ <b>Instance Peek (PID: <code>{pid}</code>)</b>",
+        f"• <b>Status:</b> {status_badge}",
+        f"• <b>Command:</b> <code>{html.escape(cmd)}</code>",
+    ]
+    if conv_title or conv_id:
+        cid_disp = f" (<code>{conv_id[:8]}</code>)" if conv_id else ""
+        header_lines.append(f"• <b>Session:</b> <code>{html.escape(conv_title or 'Active')}</code>{cid_disp}")
+
+    header = "\n".join(header_lines)
+    body_label = "⏳ <b>Streaming output (last sentences):</b>" if is_running else "💬 <b>Latest answer:</b>"
+
+    display_text = content.strip() if content else "(No output captured yet)"
+    if len(display_text) > 3200:
+        display_text = "..." + display_text[-3000:]
+
+    full_msg = f"{header}\n\n{body_label}\n<pre><code>{html.escape(display_text)}</code></pre>"
+
+    row1 = [
+        InlineKeyboardButton("🔄 Refresh Peek", callback_data=f"peek:{pid}"),
+        InlineKeyboardButton("📋 Instances", callback_data="refresh_instances"),
+    ]
+    keyboard = [row1]
+    if is_running:
+        keyboard.insert(0, [InlineKeyboardButton(f"🛑 Cancel Task (PID: {pid})", callback_data=f"cancel_task:{pid}")])
+
+    return full_msg, InlineKeyboardMarkup(keyboard)
+
+
+async def peek_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gets the latest answer or streaming output from an instance PID."""
     if not await check_auth_or_reject(update):
         return
+
+    pid: Optional[int] = None
+    if context.args:
+        try:
+            pid = int(context.args[0])
+        except ValueError:
+            if update.message:
+                await update.message.reply_html("❌ PID must be an integer: <code>/peek &lt;pid&gt;</code>")
+            return
+    else:
+        # If no PID provided, peek active task or single instance if only one exists
+        if runner.active_pid:
+            pid = runner.active_pid
+        else:
+            instances = await runner.get_instances()
+            if len(instances) == 1:
+                pid = int(instances[0]["pid"])
+            elif len(instances) > 1:
+                keyboard = []
+                for inst in instances:
+                    p = inst["pid"]
+                    st = "🟡 Running" if inst.get("is_running") else "🟢 Ready"
+                    keyboard.append([InlineKeyboardButton(f"{st} PID {p} ({inst['cmd'][:20]})", callback_data=f"peek:{p}")])
+                if update.message:
+                    await update.message.reply_html(
+                        "🔍 <b>Multiple instances found.</b> Select an instance to peek:",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                return
+            else:
+                if update.message:
+                    await update.message.reply_html(
+                        "⚠️ <b>Usage:</b> <code>/peek &lt;pid&gt;</code>\n<i>No active mgy or agy instances running.</i>"
+                    )
+                return
 
     if update.message:
         await update.message.reply_chat_action(ChatAction.TYPING)
 
-    convs = await monitor.get_recent_conversations(limit=8)
-    if not convs:
-        if update.message:
-            await update.message.reply_text("No recent conversations found.")
-        return
-
-    keyboard = []
-    text_lines = ["📜 <b>Recent Conversations:</b>\n"]
-    sess = get_chat_session(update.effective_chat.id)
-    active_cid = sess.get("conversation_id")
-
-    for c in convs:
-        cid = c.get("conversation_id", "")
-        title = c.get("title", "Untitled")
-        is_running = int(c.get("not_fully_idle", 0)) == 1
-        status_emoji = "⚡ RUNNING" if is_running else "🟢 IDLE"
-        is_selected = (cid == active_cid)
-        sel_prefix = "👉 " if is_selected else ""
-
-        text_lines.append(f"{sel_prefix}<b>{html.escape(title)}</b>\nID: <code>{cid[:8]}</code> [{status_emoji}]\n")
-        keyboard.append([InlineKeyboardButton(f"Resume {title[:20]}", callback_data=f"resume:{cid}")])
-
-    keyboard.append([InlineKeyboardButton("✨ Start Fresh (/new)", callback_data="new_session")])
-    markup = InlineKeyboardMarkup(keyboard)
+    info = await runner.peek_instance(pid)
+    text, markup = format_peek_view(info)
 
     if update.message:
-        await update.message.reply_html("\n".join(text_lines), reply_markup=markup)
+        await update.message.reply_html(text, reply_markup=markup)
+
 
 
 async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -466,6 +528,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         pid = data.split(":", 1)[1]
         await query.answer(f"🟢 Instance {pid} is ready (waiting for a prompt).", show_alert=True)
 
+    elif data.startswith("peek:"):
+        pid_str = data.split(":", 1)[1]
+        try:
+            p_val = int(pid_str)
+            info = await runner.peek_instance(p_val)
+            text, markup = format_peek_view(info)
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception as e:
+            await query.answer(f"Error: {e}")
+
     elif data == "refresh_instances":
         instances = await runner.get_instances()
         text, markup = format_instances_view(instances)
@@ -617,10 +689,10 @@ async def post_init(application) -> None:
     """Called after application is initialized. Sets up commands and starts session monitor."""
     commands = [
         BotCommand("start", "Show status & help"),
-        BotCommand("list", "Run 'mgy list' on device"),
-        BotCommand("instances", "List active mgy / agy PIDs"),
-        BotCommand("quotas", "View quota usage across profiles"),
-        BotCommand("conversations", "List recent sessions"),
+        BotCommand("accounts", "List all mgy accounts on the device."),
+        BotCommand("instances", "List active mgy / agy PIDs and status"),
+        BotCommand("quotas", "Get all mgy quotas per account."),
+        BotCommand("peek", "Get latest answer/stream: /peek <pid>"),
         BotCommand("new", "Bind session: /new <profile> [conv]"),
         BotCommand("cancel", "Cancel running task: /cancel [pid]"),
         BotCommand("kill", "Kill process by PID: /kill <pid>"),
@@ -666,10 +738,13 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
-    app.add_handler(CommandHandler("list", list_command))
+    app.add_handler(CommandHandler("accounts", accounts_command))
+    app.add_handler(CommandHandler("list", accounts_command))
     app.add_handler(CommandHandler("instances", instances_command))
     app.add_handler(CommandHandler("quotas", quotas_command))
-    app.add_handler(CommandHandler("conversations", conversations_command))
+    app.add_handler(CommandHandler("peek", peek_command))
+    app.add_handler(CommandHandler("tail", peek_command))
+    app.add_handler(CommandHandler("output", peek_command))
     app.add_handler(CommandHandler("new", new_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("kill", kill_command))

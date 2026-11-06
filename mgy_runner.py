@@ -32,6 +32,7 @@ class MgyRunner:
         self.current_dir: Optional[str] = None
         self._active_proc: Optional[asyncio.subprocess.Process] = None
         self._active_pid: Optional[int] = None
+        self._live_stream: Dict[int, List[str]] = {}
         self._is_busy: bool = False
         self._current_task_description: Optional[str] = None
 
@@ -362,6 +363,7 @@ print(json.dumps([dict(r) for r in rows]))
                     )
                     self._active_proc = proc
                     self._active_pid = proc.pid
+                    self._live_stream[proc.pid] = []
 
                     if on_start and proc.pid:
                         try:
@@ -371,9 +373,26 @@ print(json.dumps([dict(r) for r in rows]))
                         except Exception:
                             pass
 
-                    stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=SSH_TIMEOUT)
+                    async def _stream_pipe(stream, pid, collector):
+                        while True:
+                            line = await stream.readline()
+                            if not line:
+                                break
+                            decoded = line.decode("utf-8", errors="replace")
+                            collector.append(decoded)
+                            buf = self._live_stream.setdefault(pid, [])
+                            buf.append(decoded)
+                            if len(buf) > 100:
+                                buf.pop(0)
+
+                    stdout_parts: List[str] = []
+                    stderr_parts: List[str] = []
+                    t_out = asyncio.create_task(_stream_pipe(proc.stdout, proc.pid, stdout_parts))
+                    t_err = asyncio.create_task(_stream_pipe(proc.stderr, proc.pid, stderr_parts))
+
+                    await asyncio.wait_for(asyncio.gather(t_out, t_err, proc.wait()), timeout=SSH_TIMEOUT)
                     code = proc.returncode if proc.returncode is not None else 1
-                    return code, stdout_b.decode("utf-8", errors="replace"), stderr_b.decode("utf-8", errors="replace")
+                    return code, "".join(stdout_parts), "".join(stderr_parts)
                 except asyncio.TimeoutError:
                     if self._active_proc:
                         try:
@@ -442,3 +461,268 @@ print(json.dumps([dict(r) for r in rows]))
         self._current_task_description = None
         self._active_pid = None
         return 0, None, "No active running task found."
+
+    @staticmethod
+    def _extract_last_sentences(text: str, max_sentences: int = 4, max_chars: int = 1200) -> str:
+        """Extracts the last few sentences from output text."""
+        cleaned = text.strip()
+        if not cleaned or len(cleaned) <= max_chars:
+            return cleaned
+        sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+        if len(sentences) <= max_sentences:
+            return cleaned[-max_chars:]
+        last_few = " ".join(sentences[-max_sentences:]).strip()
+        return last_few if len(last_few) <= max_chars else last_few[-max_chars:]
+
+    @staticmethod
+    def _peek_inspect(pid: int) -> Dict[str, Any]:
+        """Direct local inspection of conversation and transcript for an instance PID."""
+        found_cid = None
+        found_title = None
+
+        # Check cmdline
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().decode("utf-8", errors="replace").replace("\x00", " ")
+            m = re.search(r"--conversation[=\s]+([^\s]+)", cmdline)
+            if m:
+                found_cid = m.group(1)
+        except Exception:
+            pass
+
+        # Check open fds
+        if not found_cid:
+            child_pids = [str(pid)]
+            try:
+                with open(f"/proc/{pid}/task/{pid}/children", "r") as f:
+                    child_pids.extend(f.read().split())
+            except Exception:
+                pass
+
+            for p in child_pids:
+                fd_dir = f"/proc/{p}/fd"
+                if os.path.exists(fd_dir):
+                    try:
+                        for link in os.listdir(fd_dir):
+                            target = os.readlink(os.path.join(fd_dir, link))
+                            m = re.search(r"brain/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", target)
+                            if m:
+                                found_cid = m.group(1)
+                                break
+                    except Exception:
+                        pass
+                if found_cid:
+                    break
+
+        # Fallback to latest conversation in database
+        db = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+        if os.path.exists(db):
+            try:
+                import sqlite3
+                conn = sqlite3.connect(db)
+                if found_cid:
+                    r = conn.execute("SELECT title, not_fully_idle FROM conversation_summaries WHERE conversation_id = ?", (found_cid,)).fetchone()
+                    if r:
+                        found_title = r[0]
+                else:
+                    r = conn.execute("SELECT conversation_id, title, not_fully_idle FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 1").fetchone()
+                    if r:
+                        found_cid = r[0]
+                        found_title = r[1]
+            except Exception:
+                pass
+
+        # Extract latest output from transcript
+        content = ""
+        status = "unknown"
+        if found_cid:
+            tpath = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{found_cid}/.system_generated/logs/transcript.jsonl")
+            if os.path.exists(tpath):
+                try:
+                    with open(tpath, "r", errors="replace") as f:
+                        lines = f.readlines()
+                    for line in reversed(lines):
+                        try:
+                            entry = json.loads(line)
+                            m_type = entry.get("type")
+                            c_text = entry.get("content", "").strip()
+                            th_text = entry.get("thinking", "").strip()
+                            t_calls = entry.get("tool_calls", [])
+                            if c_text:
+                                content = c_text
+                                status = "completed"
+                                break
+                            elif th_text:
+                                content = f"[Thinking]: {th_text}"
+                                status = "thinking"
+                                break
+                            elif t_calls:
+                                names = [t.get("name", "tool") for t in t_calls]
+                                content = f"[Tool Call]: {', '.join(names)}"
+                                status = "tool_call"
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        return {
+            "found": True,
+            "conversation_id": found_cid,
+            "conversation_title": found_title,
+            "content": content,
+            "transcript_status": status,
+        }
+
+    async def peek_instance(self, pid: int) -> Dict[str, Any]:
+        """
+        Inspects the instance with PID and returns its latest answer or streaming output.
+        """
+        code, out, _ = await self.run_raw(f"ps -p {pid} -o args=", timeout=5)
+        if code != 0 or not out.strip():
+            return {
+                "pid": pid,
+                "found": False,
+                "error": f"Process {pid} does not exist or has terminated.",
+            }
+
+        cmd = out.strip()
+
+        # Check running state
+        instances = await self.get_instances()
+        target_inst = next((i for i in instances if str(i.get("pid")) == str(pid)), None)
+        is_running = target_inst.get("is_running", False) if target_inst else (self._is_busy and self._active_pid == pid)
+
+        # Check live stream buffer if task was dispatched via telegravity
+        live_lines = self._live_stream.get(pid, [])
+        if is_running and live_lines:
+            stream_text = "".join(live_lines).strip()
+            sentences = self._extract_last_sentences(stream_text, max_sentences=5, max_chars=1200)
+            return {
+                "pid": pid,
+                "found": True,
+                "cmd": cmd,
+                "is_running": True,
+                "source": "live_stream",
+                "conversation_id": target_inst.get("conversation_id") if target_inst else None,
+                "conversation_title": None,
+                "content": sentences or stream_text[-1000:],
+            }
+
+        if self.mode == "local":
+            res = await asyncio.to_thread(self._peek_inspect, pid)
+        else:
+            import base64
+            inspect_code = """
+import os, sys, json, sqlite3, re
+pid = int(os.environ.get("PEEK_PID", 0))
+found_cid = None
+found_title = None
+try:
+    with open(f"/proc/{pid}/cmdline", "rb") as f:
+        cmdline = f.read().decode("utf-8", errors="replace").replace("\\x00", " ")
+    m = re.search(r"--conversation[=\\s]+([^\\s]+)", cmdline)
+    if m:
+        found_cid = m.group(1)
+except Exception:
+    pass
+if not found_cid:
+    child_pids = [str(pid)]
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children", "r") as f:
+            child_pids.extend(f.read().split())
+    except Exception:
+        pass
+    for p in child_pids:
+        fd_dir = f"/proc/{p}/fd"
+        if os.path.exists(fd_dir):
+            try:
+                for link in os.listdir(fd_dir):
+                    target = os.readlink(os.path.join(fd_dir, link))
+                    m = re.search(r"brain/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", target)
+                    if m:
+                        found_cid = m.group(1)
+                        break
+            except Exception:
+                pass
+        if found_cid:
+            break
+db = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+if os.path.exists(db):
+    try:
+        conn = sqlite3.connect(db)
+        if found_cid:
+            r = conn.execute("SELECT title, not_fully_idle FROM conversation_summaries WHERE conversation_id = ?", (found_cid,)).fetchone()
+            if r:
+                found_title = r[0]
+        else:
+            r = conn.execute("SELECT conversation_id, title, not_fully_idle FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 1").fetchone()
+            if r:
+                found_cid = r[0]
+                found_title = r[1]
+    except Exception:
+        pass
+content = ""
+status = "unknown"
+if found_cid:
+    tpath = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{found_cid}/.system_generated/logs/transcript.jsonl")
+    if os.path.exists(tpath):
+        try:
+            with open(tpath, "r", errors="replace") as f:
+                lines = f.readlines()
+            for line in reversed(lines):
+                try:
+                    entry = json.loads(line)
+                    m_type = entry.get("type")
+                    c_text = entry.get("content", "").strip()
+                    th_text = entry.get("thinking", "").strip()
+                    t_calls = entry.get("tool_calls", [])
+                    if c_text:
+                        content = c_text
+                        status = "completed"
+                        break
+                    elif th_text:
+                        content = f"[Thinking]: {th_text}"
+                        status = "thinking"
+                        break
+                    elif t_calls:
+                        names = [t.get("name", "tool") for t in t_calls]
+                        content = f"[Tool Call]: {', '.join(names)}"
+                        status = "tool_call"
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_title": found_title, "content": content, "transcript_status": status}))
+"""
+            b64_script = base64.b64encode(inspect_code.strip().encode()).decode()
+            code_p, out_p, _ = await self.run_raw(f"PEEK_PID={pid} python3 -c \"import base64; exec(base64.b64decode('{b64_script}'))\"", timeout=8)
+            res = json.loads(out_p.strip()) if code_p == 0 and out_p.strip() else {}
+
+        if res.get("found"):
+            res_content = res.get("content", "")
+            if is_running and res_content:
+                res_content = self._extract_last_sentences(res_content, max_sentences=5, max_chars=1200)
+
+            return {
+                "pid": pid,
+                "found": True,
+                "cmd": cmd,
+                "is_running": is_running,
+                "source": "transcript",
+                "conversation_id": res.get("conversation_id"),
+                "conversation_title": res.get("conversation_title"),
+                "content": res_content or ("(Waiting for first output from prompt...)" if is_running else "(No recent answer found)"),
+            }
+
+        return {
+            "pid": pid,
+            "found": True,
+            "cmd": cmd,
+            "is_running": is_running,
+            "source": "none",
+            "conversation_id": None,
+            "conversation_title": None,
+            "content": "(No conversation or transcript data found for this instance)",
+        }
