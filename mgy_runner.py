@@ -162,9 +162,11 @@ class MgyRunner:
         return profiles
 
     async def get_quotas(self) -> str:
-        """Fetches quota details across profiles."""
-        code, out, err = await self.run_raw(f"{self.mgy_bin} quotas", timeout=30)
-        return out if code == 0 else (out + "\n" + err)
+        """Fetches quota details across profiles via 'mgy quotas'."""
+        code, out, err = await self.run_raw(f"{self.mgy_bin} quotas", timeout=60)
+        raw = out if code == 0 else (out + "\n" + err)
+        cleaned = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", raw)
+        return cleaned.strip() or "No quota data returned."
 
     async def set_active_profile(self, profile: str) -> bool:
         """Sets the active profile for subsequent task dispatches."""

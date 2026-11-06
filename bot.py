@@ -148,7 +148,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• <code>/list</code> - Run 'mgy list' on the device.\n"
         f"• <code>/instances</code> - List running mgy & agy process PIDs.\n"
         f"• <code>/profiles</code> - View and switch mgy profiles.\n"
-        f"• <code>/quotas</code> - Check profile token & model quotas.\n"
+        f"• <code>/quotas</code> - Run 'mgy quotas' on the device.\n"
         f"• <code>/conversations</code> - List recent sessions.\n"
         f"• <code>/new</code> - Start a brand new conversation.\n"
         f"• <code>/cancel</code> - Cancel ongoing task execution.\n"
@@ -228,6 +228,7 @@ async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def quotas_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Returns raw output of 'mgy quotas' from the device."""
     if not await check_auth_or_reject(update):
         return
 
@@ -239,7 +240,7 @@ async def quotas_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chat_id=update.effective_chat.id,
         bot=context.bot,
         text=quotas_text or "No quota data returned.",
-        header="📊 <b>Multigravity Quotas:</b>",
+        header="📊 <b>mgy quotas:</b>",
     )
 
 

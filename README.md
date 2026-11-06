@@ -109,7 +109,7 @@ flowchart TD
 | `/list`              | Output raw `mgy list` from the target device                   |
 | `/instances`         | List running `mgy` and `agy` process PIDs and commands         |
 | `/profiles`          | List all multigravity profiles and switch with tap buttons     |
-| `/quotas`            | View quota usage across all profiles                           |
+| `/quotas`            | Output raw `mgy quotas` from the target device                 |
 | `/conversations`     | View recent sessions with live status (`⚡ RUNNING` / `🟢 IDLE`) |
 | `/new`               | Start a fresh session (clears conversation context)            |
 | `/cancel`            | Abort/interrupt the currently running task                     |
