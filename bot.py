@@ -117,11 +117,19 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
     cid = conv_info.get("conversation_id", "")
     short_id = cid[:8] if cid else "unknown"
 
-    header = f"🔔 <b>Task Completed!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{short_id}</code>)"
-
-    keyboard = [
-        [InlineKeyboardButton("💬 Continue This Session", callback_data=f"resume:{cid}")]
-    ]
+    if "Individual quota reached" in output_text or "RESOURCE_EXHAUSTED" in output_text:
+        header = f"⚠️ <b>Quota Limit Reached!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{short_id}</code>)"
+        keyboard = [
+            [
+                InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas"),
+                InlineKeyboardButton("✨ New Session", callback_data="new_session"),
+            ]
+        ]
+    else:
+        header = f"🔔 <b>Task Completed!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{short_id}</code>)"
+        keyboard = [
+            [InlineKeyboardButton("💬 Continue This Session", callback_data=f"resume:{cid}")]
+        ]
     markup = InlineKeyboardMarkup(keyboard)
 
     # Deliver to all known authorized chats
@@ -524,6 +532,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="HTML",
         )
 
+    elif data == "do_quotas":
+        quotas_text = await runner.get_quotas()
+        await send_chunked_code(
+            chat_id=chat_id,
+            bot=context.bot,
+            text=quotas_text or "No quota data returned.",
+            header="📊 <b>mgy quotas:</b>",
+        )
+
     elif data.startswith("instance_ready:"):
         pid = data.split(":", 1)[1]
         await query.answer(f"🟢 Instance {pid} is ready (waiting for a prompt).", show_alert=True)
@@ -668,7 +685,10 @@ async def _execute_and_reply(
         if not output:
             output = "(Task completed with empty output)"
 
-        header = f"✅ <b>Task Completed (profile: {profile})</b>:"
+        if "Individual quota reached" in output or "RESOURCE_EXHAUSTED" in output:
+            header = f"⚠️ <b>Quota Limit Reached (profile: {profile})</b>:"
+        else:
+            header = f"✅ <b>Task Completed (profile: {profile})</b>:"
         await send_chunked_code(
             chat_id=chat_id,
             bot=context.bot,

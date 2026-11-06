@@ -45,23 +45,41 @@ print(json.dumps([dict(r) for r in rows]))
         return []
 
     async def get_latest_output(self, conversation_id: str) -> str:
-        """Retrieves the latest PLANNER_RESPONSE from transcript.jsonl."""
+        """Retrieves the latest PLANNER_RESPONSE from transcript.jsonl or detects quota exhaustion."""
         fetch_code = f"""
-import json, os
+import json, os, glob, re
 conv_id = "{conversation_id}"
 path = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{{conv_id}}/.system_generated/logs/transcript.jsonl")
+output = ""
+
 if os.path.exists(path):
     with open(path, "r", errors="replace") as f:
         lines = f.readlines()
         for line in reversed(lines):
             try:
                 data = json.loads(line)
-                if data.get("type") == "PLANNER_RESPONSE":
-                    print(data.get("content", ""))
-                    exit(0)
+                if data.get("type") == "PLANNER_RESPONSE" and data.get("content"):
+                    output = data.get("content", "").strip()
+                    break
             except:
                 pass
-print("")
+
+if not output:
+    log_files = sorted(glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/log/cli-*.log")), key=os.path.getmtime, reverse=True)
+    if log_files:
+        try:
+            with open(log_files[0], "r", errors="replace") as f:
+                log_lines = f.readlines()
+            for l in reversed(log_lines[-80:]):
+                if "RESOURCE_EXHAUSTED" in l or "quota reached" in l:
+                    m = re.search(r"(Individual quota reached[^\n\r]+)", l)
+                    if m:
+                        output = f"⚠️ {m.group(1).strip()}"
+                        break
+        except:
+            pass
+
+print(output)
 """
         cmd = f"python3 -c '{fetch_code.strip()}'"
         code, out, _ = await self.runner.run_raw(cmd, timeout=10)

@@ -548,21 +548,40 @@ print(json.dumps([dict(r) for r in rows]))
                             c_text = entry.get("content", "").strip()
                             th_text = entry.get("thinking", "").strip()
                             t_calls = entry.get("tool_calls", [])
-                            if c_text:
-                                content = c_text
-                                status = "completed"
-                                break
-                            elif th_text:
-                                content = f"[Thinking]: {th_text}"
-                                status = "thinking"
-                                break
-                            elif t_calls:
-                                names = [t.get("name", "tool") for t in t_calls]
-                                content = f"[Tool Call]: {', '.join(names)}"
-                                status = "tool_call"
-                                break
+                            if m_type == "PLANNER_RESPONSE":
+                                if c_text:
+                                    content = c_text
+                                    status = "completed"
+                                    break
+                                elif th_text:
+                                    content = f"[Thinking]: {th_text}"
+                                    status = "thinking"
+                                    break
+                                elif t_calls:
+                                    names = [t.get("name", "tool") for t in t_calls]
+                                    content = f"[Tool Call]: {', '.join(names)}"
+                                    status = "tool_call"
+                                    break
                         except Exception:
                             pass
+                except Exception:
+                    pass
+
+        # If no planner response, check if a quota exhaustion error occurred in CLI logs
+        if not content:
+            import glob
+            log_files = sorted(glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/log/cli-*.log")), key=os.path.getmtime, reverse=True)
+            if log_files:
+                try:
+                    with open(log_files[0], "r", errors="replace") as f:
+                        log_lines = f.readlines()
+                    for l in reversed(log_lines[-80:]):
+                        if "RESOURCE_EXHAUSTED" in l or "quota reached" in l:
+                            m = re.search(r"(Individual quota reached[^\n\r]+)", l)
+                            if m:
+                                content = f"⚠️ {m.group(1).strip()}"
+                                status = "quota_exhausted"
+                                break
                 except Exception:
                     pass
 
@@ -677,19 +696,20 @@ if found_cid:
                     c_text = entry.get("content", "").strip()
                     th_text = entry.get("thinking", "").strip()
                     t_calls = entry.get("tool_calls", [])
-                    if c_text:
-                        content = c_text
-                        status = "completed"
-                        break
-                    elif th_text:
-                        content = f"[Thinking]: {th_text}"
-                        status = "thinking"
-                        break
-                    elif t_calls:
-                        names = [t.get("name", "tool") for t in t_calls]
-                        content = f"[Tool Call]: {', '.join(names)}"
-                        status = "tool_call"
-                        break
+                    if m_type == "PLANNER_RESPONSE":
+                        if c_text:
+                            content = c_text
+                            status = "completed"
+                            break
+                        elif th_text:
+                            content = f"[Thinking]: {th_text}"
+                            status = "thinking"
+                            break
+                        elif t_calls:
+                            names = [t.get("name", "tool") for t in t_calls]
+                            content = f"[Tool Call]: {', '.join(names)}"
+                            status = "tool_call"
+                            break
                 except Exception:
                     pass
         except Exception:
