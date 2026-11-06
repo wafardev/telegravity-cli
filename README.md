@@ -110,6 +110,7 @@ flowchart TD
 | `/instances`                 | List running instances with 🟢 Ready / 🟡 Running / 🔴 Depleted & Peek buttons|
 | `/quotas`                    | Get all mgy quotas per account                                 |
 | `/peek <pid>`                | Get latest answer or live stream output from instance PID      |
+| `/run <pid> [prompt]`        | Run a prompt targeting a specific instance PID                 |
 | `/new <profile> [conv]`      | Bind chat session to a profile and optional conversation ID    |
 | `/cancel [pid]`              | Abort/interrupt running task (shows PID and supports cancel by PID) |
 | `/kill <pid>`                | Terminate any process by PID on the target device              |

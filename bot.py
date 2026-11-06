@@ -169,6 +169,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• <code>/instances</code> - List running mgy & agy process PIDs.\n"
         f"• <code>/quotas</code> - Get all mgy quotas per account.\n"
         f"• <code>/peek &lt;pid&gt;</code> - Get latest answer or stream from instance.\n"
+        f"• <code>/run &lt;pid&gt; [prompt]</code> - Run a prompt on a specific instance.\n"
         f"• <code>/new &lt;profile&gt; [conv]</code> - Bind session to profile & conversation.\n"
         f"• <code>/cancel [pid]</code> - Cancel running task (appends PID).\n"
         f"• <code>/kill &lt;pid&gt;</code> - Kill any process by PID.\n"
@@ -197,7 +198,7 @@ async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 def format_instances_view(instances: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
-    """Formats the instances list with status indicators and interactive buttons."""
+    """Formats the instances list with status indicators and interactive action buttons."""
     if not instances:
         text = "🔍 <b>Active Instances:</b>\n\n<i>No running mgy or agy instances found on target device.</i>"
         keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="refresh_instances")]]
@@ -215,28 +216,33 @@ def format_instances_view(instances: list[dict]) -> tuple[str, InlineKeyboardMar
 
         if is_running:
             status_text = "🟡 <b>Running</b> <i>(in a prompt)</i>"
-            btn_text = f"🟡 Running (PID: {pid})"
-            btn_cb = f"cancel_task:{pid}"
+            row = [
+                InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
+                InlineKeyboardButton(f"🛑 Cancel {pid}", callback_data=f"cancel_task:{pid}"),
+            ]
         elif is_depleted:
             reset_desc = f" <i>(resets in {reset_time})</i>" if reset_time else ""
             status_text = f"🔴 <b>Quota Depleted</b>{reset_desc}"
-            btn_text = f"🔴 Quota Depleted ({pid})"
-            btn_cb = f"quota_info:{pid}"
+            row = [
+                InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
+                InlineKeyboardButton(f"🚀 Run {pid}", callback_data=f"run_inst:{pid}"),
+                InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
+            ]
         else:
             status_text = "🟢 <b>Ready</b> <i>(waiting for a prompt)</i>"
-            btn_text = f"🟢 Ready (PID: {pid})"
-            btn_cb = f"instance_ready:{pid}"
+            row = [
+                InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
+                InlineKeyboardButton(f"🚀 Run {pid}", callback_data=f"run_inst:{pid}"),
+                InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
+            ]
 
         lines.append(
             f"• <b>PID:</b> <code>{pid}</code> — {status_text}\n"
             f"  <code>{html.escape(cmd)}</code>\n"
         )
-        keyboard.append([
-            InlineKeyboardButton(btn_text, callback_data=btn_cb),
-            InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
-        ])
+        keyboard.append(row)
 
-    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_instances")])
+    keyboard.append([InlineKeyboardButton("🔄 Refresh Instances", callback_data="refresh_instances")])
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
 
@@ -313,12 +319,16 @@ def format_peek_view(info: dict) -> tuple[str, InlineKeyboardMarkup]:
     full_msg = f"{header}\n\n{body_label}\n<pre><code>{html.escape(display_text)}</code></pre>"
 
     row1 = [
-        InlineKeyboardButton("🔄 Refresh Peek", callback_data=f"peek:{pid}"),
-        InlineKeyboardButton("📋 Instances", callback_data="refresh_instances"),
+        InlineKeyboardButton("🔄 Refresh", callback_data=f"peek:{pid}"),
+        InlineKeyboardButton("🚀 Run", callback_data=f"run_inst:{pid}"),
     ]
     keyboard = [row1]
     if is_running:
-        keyboard.insert(0, [InlineKeyboardButton(f"🛑 Cancel Task (PID: {pid})", callback_data=f"cancel_task:{pid}")])
+        keyboard.append([InlineKeyboardButton("🛑 Cancel Task", callback_data=f"cancel_task:{pid}")])
+    else:
+        keyboard.append([InlineKeyboardButton("💀 Kill Process", callback_data=f"kill_inst:{pid}")])
+
+    keyboard.append([InlineKeyboardButton("📋 Back to Instances", callback_data="refresh_instances")])
 
     return full_msg, InlineKeyboardMarkup(keyboard)
 
@@ -371,6 +381,90 @@ async def peek_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if update.message:
         await update.message.reply_html(text, reply_markup=markup)
+
+
+async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs a prompt on a specific instance: /run <pid> [prompt]"""
+    if not await check_auth_or_reject(update):
+        return
+
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+        instances = await runner.get_instances()
+        if not instances:
+            if update.message:
+                await update.message.reply_html(
+                    "⚠️ <b>Usage:</b> <code>/run &lt;pid&gt; [prompt]</code>\n<i>No active mgy or agy instances running.</i>"
+                )
+            return
+
+        keyboard = []
+        for inst in instances:
+            p = inst["pid"]
+            prof = inst.get("profile", "default")
+            st = "🟡" if inst.get("is_running") else ("🔴" if inst.get("is_quota_depleted") else "🟢")
+            keyboard.append([InlineKeyboardButton(f"{st} Run on PID {p} ({prof})", callback_data=f"run_inst:{p}")])
+
+        if update.message:
+            await update.message.reply_html(
+                "🚀 <b>Select an instance to run a prompt on:</b>",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        return
+
+    try:
+        pid = int(context.args[0])
+    except ValueError:
+        if update.message:
+            await update.message.reply_html("❌ PID must be an integer: <code>/run &lt;pid&gt; [prompt]</code>")
+        return
+
+    instances = await runner.get_instances()
+    inst = next((i for i in instances if str(i.get("pid")) == str(pid)), None)
+    prof = inst.get("profile", runner.default_profile or "default") if inst else (runner.default_profile or "default")
+    cid = inst.get("conversation_id") if inst else None
+
+    prompt = " ".join(context.args[1:]).strip() if len(context.args) > 1 else ""
+    if prompt:
+        chat_sessions[chat_id] = {
+            "profile": prof,
+            "conversation_id": cid,
+        }
+        preview_prompt = prompt[:100] + ("..." if len(prompt) > 100 else "")
+        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data=f"cancel_task:{pid}")]])
+        status_msg = await update.message.reply_html(
+            f"🚀 <b>Task dispatched to {prof} (Target PID: <code>{pid}</code>)...</b>\n"
+            f"<i>Prompt:</i> <code>{html.escape(preview_prompt)}</code>\n\n"
+            f"⏳ Processing in background...",
+            reply_markup=cancel_btn,
+        )
+        asyncio.create_task(
+            _execute_and_reply(
+                prompt=prompt,
+                profile=prof,
+                conv_id=cid,
+                continue_session=(cid is None),
+                status_msg=status_msg,
+                preview_prompt=preview_prompt,
+                chat_id=chat_id,
+                context=context,
+            )
+        )
+    else:
+        context.user_data["pending_run"] = {
+            "pid": pid,
+            "profile": prof,
+            "conversation_id": cid,
+        }
+        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Prompt", callback_data="cancel_pending_run")]])
+        cid_disp = f" (conv: <code>{cid[:8]}</code>)" if cid else ""
+        if update.message:
+            await update.message.reply_html(
+                f"🚀 <b>Run on PID <code>{pid}</code></b> (profile: <b>{prof}</b>{cid_disp})\n\n"
+                f"<i>Send the prompt to insert:</i>",
+                reply_markup=cancel_btn,
+            )
 
 
 
@@ -567,6 +661,66 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         rst_str = f" Resets in {rst}." if rst else ""
         await query.answer(f"🔴 Instance {pid} stopped: Quota reached.{rst_str}\nSwitch accounts with /new or check /quotas.", show_alert=True)
 
+    elif data.startswith("run_inst:"):
+        pid_str = data.split(":", 1)[1]
+        try:
+            pid = int(pid_str)
+            instances = await runner.get_instances()
+            inst = next((i for i in instances if str(i.get("pid")) == str(pid)), None)
+            if inst and inst.get("is_running"):
+                await query.answer(f"⚠️ Instance {pid} is currently busy running a prompt. Cancel it first.", show_alert=True)
+                return
+
+            prof = inst.get("profile", runner.default_profile or "default") if inst else (runner.default_profile or "default")
+            cid = inst.get("conversation_id") if inst else None
+
+            context.user_data["pending_run"] = {
+                "pid": pid,
+                "profile": prof,
+                "conversation_id": cid,
+            }
+
+            cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Prompt", callback_data="cancel_pending_run")]])
+            cid_disp = f" (conv: <code>{cid[:8]}</code>)" if cid else ""
+            await query.message.reply_html(
+                f"🚀 <b>Run on PID <code>{pid}</code></b> (profile: <b>{prof}</b>{cid_disp})\n\n"
+                f"<i>Send the prompt to insert:</i>",
+                reply_markup=cancel_btn,
+            )
+            await query.answer()
+        except Exception as e:
+            await query.answer(f"Error: {e}")
+
+    elif data.startswith("kill_inst:"):
+        pid_str = data.split(":", 1)[1]
+        try:
+            pid = int(pid_str)
+            success, msg = await runner.kill_process(pid)
+            await query.answer(f"💀 Process {pid}: {msg}", show_alert=True)
+            await asyncio.sleep(0.4)
+            # Refresh view
+            orig_text = query.message.text or "" if query.message else ""
+            if "Active Instances" in orig_text:
+                instances = await runner.get_instances()
+                text, markup = format_instances_view(instances)
+                try:
+                    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+                except Exception:
+                    pass
+            elif "Instance Peek" in orig_text:
+                info = await runner.peek_instance(pid)
+                text, markup = format_peek_view(info)
+                try:
+                    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+                except Exception:
+                    pass
+        except Exception as e:
+            await query.answer(f"Error killing PID {pid_str}: {e}")
+
+    elif data == "cancel_pending_run":
+        context.user_data.pop("pending_run", None)
+        await query.edit_message_text("❌ Prompt insertion cancelled.")
+
     elif data.startswith("peek:"):
         pid_str = data.split(":", 1)[1]
         try:
@@ -616,8 +770,22 @@ async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     chat_id = update.effective_chat.id
-    session = get_chat_session(chat_id)
-    profile = session["profile"]
+
+    pending = context.user_data.pop("pending_run", None)
+    if pending:
+        profile = pending["profile"]
+        conv_id = pending.get("conversation_id")
+        target_pid = pending.get("pid")
+        chat_sessions[chat_id] = {
+            "profile": profile,
+            "conversation_id": conv_id,
+        }
+        dispatch_label = f"Task dispatched to {profile} (Target PID: <code>{target_pid}</code>)..."
+    else:
+        session = get_chat_session(chat_id)
+        profile = session["profile"]
+        conv_id = session.get("conversation_id")
+        dispatch_label = f"Task dispatched to {profile}..."
 
     if runner.is_busy:
         if update.message:
@@ -633,14 +801,13 @@ async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         return
 
-    conv_id = session.get("conversation_id")
     continue_session = (conv_id is None)
 
     # Initial acknowledgement
     preview_prompt = prompt[:100] + ("..." if len(prompt) > 100 else "")
     cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_task")]])
     status_msg = await update.message.reply_html(
-        f"🚀 <b>Task dispatched to {profile}...</b>\n"
+        f"🚀 <b>{dispatch_label}</b>\n"
         f"<i>Prompt:</i> <code>{html.escape(preview_prompt)}</code>\n\n"
         f"⏳ Processing in background...",
         reply_markup=cancel_btn,
@@ -735,6 +902,7 @@ async def post_init(application) -> None:
         BotCommand("instances", "List active mgy / agy PIDs and status"),
         BotCommand("quotas", "Get all mgy quotas per account."),
         BotCommand("peek", "Get latest answer/stream: /peek <pid>"),
+        BotCommand("run", "Run prompt on instance: /run <pid> [prompt]"),
         BotCommand("new", "Bind session: /new <profile> [conv]"),
         BotCommand("cancel", "Cancel running task: /cancel [pid]"),
         BotCommand("kill", "Kill process by PID: /kill <pid>"),
@@ -787,6 +955,7 @@ def main() -> None:
     app.add_handler(CommandHandler("peek", peek_command))
     app.add_handler(CommandHandler("tail", peek_command))
     app.add_handler(CommandHandler("output", peek_command))
+    app.add_handler(CommandHandler("run", run_command))
     app.add_handler(CommandHandler("new", new_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("kill", kill_command))
