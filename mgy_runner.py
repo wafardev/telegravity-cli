@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import time
 from typing import Optional, Tuple, List, Dict, Callable, Any
 from config import (
     RUN_MODE,
@@ -965,7 +966,7 @@ sys.exit(res.returncode)
             glob.glob(os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/log/cli-*.log"))
         )
         log_files = sorted([f for f in cand_logs if os.path.exists(f)], key=os.path.getmtime, reverse=True)
-        if log_files:
+        if log_files and (time.time() - os.path.getmtime(log_files[0])) < 480:
             try:
                 with open(log_files[0], "r", errors="replace") as f:
                     log_lines = f.readlines()
@@ -973,9 +974,7 @@ sys.exit(res.returncode)
                     if "RESOURCE_EXHAUSTED" in l or "quota reached" in l:
                         m = re.search(r"(Individual quota reached[^\n\r]+)", l)
                         if m:
-                            quota_msg = f"⚠️ {m.group(1).strip()}"
-                            if not content:
-                                content = quota_msg
+                            content = f"⚠️ {m.group(1).strip()}"
                             status = "quota_exhausted"
                             break
             except Exception:

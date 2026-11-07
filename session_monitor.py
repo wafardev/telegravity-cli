@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from typing import Callable, Optional, Dict, List, Any
 from mgy_runner import MgyRunner
 from config import POLL_INTERVAL
@@ -59,6 +60,26 @@ class SessionMonitor:
 
     @staticmethod
     def _fetch_latest_output_sync(conversation_id: str) -> str:
+        # 1. Proactively check for recent quota exhaustion in CLI logs across all profiles
+        cand_logs = glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/log/cli-*.log")) + glob.glob(
+            os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/log/cli-*.log")
+        )
+        if cand_logs:
+            latest_log = max(cand_logs, key=os.path.getmtime)
+            # If log was modified within the last 8 minutes (480 seconds)
+            if (time.time() - os.path.getmtime(latest_log)) < 480:
+                try:
+                    with open(latest_log, "r", errors="replace") as f:
+                        log_lines = f.readlines()
+                    for l in reversed(log_lines[-80:]):
+                        if "RESOURCE_EXHAUSTED" in l or "quota reached" in l:
+                            match_quota = re.search(r"(Individual quota reached[^\n\r]+)", l)
+                            if match_quota:
+                                return "⚠️ " + match_quota.group(1).strip()
+                except Exception:
+                    pass
+
+        # 2. Extract latest PLANNER_RESPONSE from transcript.jsonl
         cand = [
             os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{conversation_id}/.system_generated/logs/transcript.jsonl")
         ] + glob.glob(
@@ -81,24 +102,6 @@ class SessionMonitor:
                         pass
             except Exception:
                 pass
-
-        if not output:
-            cand_logs = glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/log/cli-*.log")) + glob.glob(
-                os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/log/cli-*.log")
-            )
-            log_files = sorted([f for f in cand_logs if os.path.exists(f)], key=os.path.getmtime, reverse=True)
-            if log_files:
-                try:
-                    with open(log_files[0], "r", errors="replace") as f:
-                        log_lines = f.readlines()
-                    for l in reversed(log_lines[-80:]):
-                        if "RESOURCE_EXHAUSTED" in l or "quota reached" in l:
-                            match_quota = re.search(r"(Individual quota reached[^\n\r]+)", l)
-                            if match_quota:
-                                output = "⚠️ " + match_quota.group(1).strip()
-                                break
-                except Exception:
-                    pass
 
         return output
 
@@ -216,7 +219,7 @@ class SessionMonitor:
                             logger.info("Detected task completion for conversation %s (%s, step: %s)", cid, c.get("title"), curr_steps)
                             latest_output = await self.get_latest_output(cid)
                             if not latest_output:
-                                latest_output = c.get("preview", "")
+                                latest_output = "(Turn finished with no new output text)"
 
                             if self._on_task_completed_cb:
                                 try:

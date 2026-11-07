@@ -173,7 +173,7 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
     cid = conv_info.get("conversation_id", "")
     short_id = cid[:8] if cid else "unknown"
 
-    if "Individual quota reached" in output_text or "RESOURCE_EXHAUSTED" in output_text:
+    if "Individual quota reached" in output_text or "RESOURCE_EXHAUSTED" in output_text or output_text.startswith("⚠️"):
         header = f"⚠️ <b>Quota Limit Reached!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{short_id}</code>)"
         keyboard = [
             [
