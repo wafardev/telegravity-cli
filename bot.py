@@ -1330,7 +1330,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cd", cd_command))
     app.add_handler(CommandHandler("pwd", pwd_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_task_message))
+    app.add_handler(MessageHandler(filters.TEXT, handle_task_message))
 
     app.run_polling()
 

@@ -524,17 +524,20 @@ print("OK")
         if pid <= 0:
             return False, "Invalid PID."
 
+        # Flatten multiline text for single-line terminal prompt (prevents premature Enter submission)
+        cleaned_text = " ".join(line.strip() for line in text.splitlines() if line.strip())
+        if not cleaned_text:
+            return False, "Prompt is empty."
+
         # Ensure text ends with carriage return (\r) for terminal prompt submission
-        if not text.endswith("\r") and not text.endswith("\n"):
-            text += "\r"
-        elif text.endswith("\n"):
-            text = text[:-1] + "\r"
+        if not cleaned_text.endswith("\r"):
+            cleaned_text += "\r"
 
         has_tty = await self.has_interactive_tty(pid)
         if not has_tty:
             return False, f"Process {pid} is not attached to an interactive terminal."
 
-        b64_data = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        b64_data = base64.b64encode(cleaned_text.encode("utf-8")).decode("ascii")
 
         gdb_script = """import gdb, os, base64, sys
 try:
