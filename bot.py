@@ -197,6 +197,7 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
     markup = InlineKeyboardMarkup(keyboard)
 
     # Deliver to all known authorized chats
+    delivered_any = False
     for cid_target in list(known_chats):
         try:
             await send_response_or_file(
@@ -207,8 +208,10 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
                 filename=f"response_{short_id}.txt",
                 reply_markup=markup,
             )
+            delivered_any = True
         except Exception as e:
             logger.warning("Failed to deliver completion alert to chat %s: %s", cid_target, e)
+    return delivered_any
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

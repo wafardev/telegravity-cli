@@ -398,6 +398,11 @@ class SessionMonitor:
         handled.add(step_index)
         return True
 
+    def unclaim_step(self, conversation_id: str, step_index: int) -> None:
+        """Unclaims a step if network delivery failed, allowing a retry."""
+        if conversation_id in self._handled_conv_steps:
+            self._handled_conv_steps[conversation_id].discard(step_index)
+
     def mark_handled(self, conversation_id: str, step_index: int) -> None:
         """Marks a conversation step as handled."""
         if conversation_id and step_index >= 0:
@@ -609,13 +614,19 @@ class SessionMonitor:
                     # Atomically claim step to ensure exactly one delivery
                     if self.claim_step(cid, s_idx):
                         logger.info("Delivering prompt response for %s (Step #%s, PID %s)", cid, s_idx, resp.get("pid"))
+                        delivered = False
                         if self._on_task_completed_cb:
                             try:
                                 r = self._on_task_completed_cb(resp, content)
                                 if asyncio.iscoroutine(r):
-                                    await r
+                                    delivered = await r
+                                else:
+                                    delivered = bool(r)
                             except Exception as cb_err:
                                 logger.error("Error in on_task_completed callback: %s", cb_err)
+                        if not delivered:
+                            logger.warning("Delivery failed for %s step #%s (likely network drop), unclaiming to retry on next poll", cid, s_idx)
+                            self.unclaim_step(cid, s_idx)
 
                 # Handle new quota exhaustion errors
                 for q in res.get("new_quotas", []):
