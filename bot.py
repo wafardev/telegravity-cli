@@ -55,7 +55,7 @@ monitor = SessionMonitor(runner=runner)
 # Active session tracking per chat (chat_id -> {"profile": str, "conversation_id": Optional[str]})
 chat_sessions: dict[int, dict] = {}
 # Known authorized chats to notify on external completion
-known_chats: Set[int] = set()
+known_chats: Set[int] = set(ALLOWED_USER_IDS)
 
 
 def is_authorized(user_id: int) -> bool:
@@ -168,13 +168,16 @@ async def send_response_or_file(
 
 
 async def on_external_task_completed(conv_info: dict, output_text: str, application) -> None:
-    """Notification callback triggered by SessionMonitor when any agy turn completes."""
-    title = conv_info.get("title", "Untitled Task")
+    """Notification callback triggered by SessionMonitor when any prompt response completes."""
+    title = conv_info.get("title") or "Untitled Task"
     cid = conv_info.get("conversation_id", "")
     short_id = cid[:8] if cid else "unknown"
+    pid = conv_info.get("pid")
+    profile = conv_info.get("profile", "")
+    step_index = conv_info.get("step_index")
 
     if "Individual quota reached" in output_text or "RESOURCE_EXHAUSTED" in output_text or output_text.startswith("⚠️"):
-        header = f"⚠️ <b>Quota Limit Reached!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{short_id}</code>)"
+        header = f"⚠️ <b>Quota Limit Reached!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{cid}</code>)"
         keyboard = [
             [
                 InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas"),
@@ -182,10 +185,15 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
             ]
         ]
     else:
-        header = f"🔔 <b>Task Completed!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{short_id}</code>)"
-        keyboard = [
-            [InlineKeyboardButton("💬 Continue This Session", callback_data=f"resume:{cid}")]
-        ]
+        pid_disp = f" (PID: <code>{pid}</code>)" if pid else ""
+        prof_disp = f" (<b>{html.escape(profile)}</b>)" if profile else ""
+        step_disp = f" [Step #{step_index}]" if step_index is not None else ""
+        header = f"💬 <b>Response from <code>{cid}</code>{pid_disp}{prof_disp}{step_disp}:</b>\n<b>Session:</b> <i>{html.escape(title)}</i>"
+        btn_row = [InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}")]
+        if pid:
+            btn_row.append(InlineKeyboardButton("👁️ Peek", callback_data=f"peek:{pid}"))
+            btn_row.append(InlineKeyboardButton("🚀 Run", callback_data=f"run_inst:{pid}"))
+        keyboard = [btn_row]
     markup = InlineKeyboardMarkup(keyboard)
 
     # Deliver to all known authorized chats
@@ -196,7 +204,7 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
                 bot=application.bot,
                 text=output_text or "(Task finished with no text output)",
                 header=header,
-                filename=f"task_{short_id}.txt",
+                filename=f"response_{short_id}.txt",
                 reply_markup=markup,
             )
         except Exception as e:
@@ -532,35 +540,38 @@ async def _wait_for_injected_response(
 
         final_text = info.get("raw_latest_model") or content
         if new_step_completed and status == "completed" and final_text and final_text != "(Waiting for first output from prompt...)" and final_text != last_delivered_content:
-            responses_delivered += 1
             last_seen_step = curr_step
             last_delivered_content = final_text
             poll_count = 0  # Reset idle timeout since progress is actively being made!
 
-            # Deliver response message to chat
-            reply_buttons = [
-                [
-                    InlineKeyboardButton(f"🚀 Run {pid}", callback_data=f"run_inst:{pid}"),
-                    InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
-                    InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
+            # Atomically claim the step so we don't deliver duplicate messages if SessionMonitor also claimed it
+            step_claimed = True
+            if cid and curr_step != -1:
+                step_claimed = monitor.claim_step(cid, curr_step)
+
+            if step_claimed:
+                responses_delivered += 1
+                reply_buttons = [
+                    [
+                        InlineKeyboardButton(f"🚀 Run {pid}", callback_data=f"run_inst:{pid}"),
+                        InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
+                        InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
+                    ]
                 ]
-            ]
-            markup = InlineKeyboardMarkup(reply_buttons)
-            turn_label = f" (Turn #{responses_delivered})" if responses_delivered > 1 else ""
-            header = f"💬 <b>Response from PID <code>{pid}</code> (<b>{html.escape(profile)}</b>){turn_label}:</b>"
+                markup = InlineKeyboardMarkup(reply_buttons)
+                turn_label = f" (Turn #{responses_delivered})" if responses_delivered > 1 else ""
+                header = f"💬 <b>Response from PID <code>{pid}</code> (<b>{html.escape(profile)}</b>){turn_label}:</b>"
 
-            # Mark conversation handled in SessionMonitor
-            if cid:
-                monitor.mark_handled(cid, curr_step)
-
-            await send_response_or_file(
-                chat_id=chat_id,
-                bot=context.bot,
-                text=final_text,
-                header=header,
-                filename=f"response_{pid}.txt",
-                reply_markup=markup,
-            )
+                await send_response_or_file(
+                    chat_id=chat_id,
+                    bot=context.bot,
+                    text=final_text,
+                    header=header,
+                    filename=f"response_{pid}.txt",
+                    reply_markup=markup,
+                )
+            else:
+                logger.info("Response for %s (step %s) already delivered by SessionMonitor.", cid, curr_step)
 
             # Update the status message
             try:

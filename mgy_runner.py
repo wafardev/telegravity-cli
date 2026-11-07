@@ -905,6 +905,9 @@ sys.exit(res.returncode)
                                 th_text = entry.get("thinking", "").strip()
                                 t_calls = entry.get("tool_calls", [])
                                 if c_text:
+                                    if current_turn["model"] is not None:
+                                        turns.append(current_turn)
+                                        current_turn = {"user": None, "tools": [], "thinking": None, "model": None, "step_index": -1}
                                     current_turn["model"] = c_text
                                     current_turn["step_index"] = s_idx
                                 elif th_text:
@@ -921,10 +924,17 @@ sys.exit(res.returncode)
                         turns.append(current_turn)
 
                     if turns:
+                        latest_model = None
+                        latest_model_step = -1
+                        for t in reversed(turns):
+                            if t.get("model"):
+                                latest_model = t["model"]
+                                latest_model_step = t.get("step_index", -1)
+                                break
+
                         last_t = turns[-1]
-                        latest_step = last_t.get("step_index", -1)
-                        latest_model = last_t.get("model")
-                        if latest_model:
+                        latest_step = latest_model_step if latest_model_step != -1 else last_t.get("step_index", -1)
+                        if last_t.get("model"):
                             status = "completed"
                         elif last_t.get("thinking"):
                             status = "thinking"
@@ -1108,6 +1118,9 @@ if found_cid:
                         th_text = entry.get("thinking", "").strip()
                         t_calls = entry.get("tool_calls", [])
                         if c_text:
+                            if cur_turn["model"] is not None:
+                                turns.append(cur_turn)
+                                cur_turn = {"user": None, "tools": [], "thinking": None, "model": None, "step_index": -1}
                             cur_turn["model"] = c_text
                             cur_turn["step_index"] = s_idx
                         elif th_text:
@@ -1123,10 +1136,17 @@ if found_cid:
                 turns.append(cur_turn)
 
             if turns:
+                latest_model = None
+                latest_model_step = -1
+                for t in reversed(turns):
+                    if t.get("model"):
+                        latest_model = t["model"]
+                        latest_model_step = t.get("step_index", -1)
+                        break
+
                 last_t = turns[-1]
-                latest_step = last_t.get("step_index", -1)
-                latest_model = last_t.get("model")
-                if latest_model:
+                latest_step = latest_model_step if latest_model_step != -1 else last_t.get("step_index", -1)
+                if last_t.get("model"):
                     status = "completed"
                 elif last_t.get("thinking"):
                     status = "thinking"
