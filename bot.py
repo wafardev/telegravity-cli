@@ -229,18 +229,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• /cd &lt;path&gt; - Change target directory.\n"
         f"• /status - View host and task status."
     )
-    keyboard = [
-        [
-            InlineKeyboardButton("📋 /instances", callback_data="refresh_instances"),
-            InlineKeyboardButton("📊 /quotas", callback_data="do_quotas"),
-        ],
-        [
-            InlineKeyboardButton("👥 /accounts", callback_data="do_accounts"),
-            InlineKeyboardButton("📈 /status", callback_data="do_status"),
-        ],
-    ]
     if update.message:
-        await update.message.reply_html(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_html(welcome_text)
 
 
 async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
