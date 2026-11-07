@@ -58,9 +58,26 @@ def _poll_scan_sync(handled_map: Dict[str, List[int]], handled_quotas: List[str]
                         m_prof = re.search(r"multigravity-profiles/([^/]+)/", cmdline)
                         if not m_prof:
                             m_mgy = re.search(r"mgy\s+([a-zA-Z0-9_\-]+)", cmdline)
-                            prof = m_mgy.group(1) if m_mgy else "default"
+                            prof = m_mgy.group(1) if m_mgy else ""
                         else:
                             prof = m_prof.group(1)
+                        if not prof:
+                            try:
+                                with open(f"{p}/stat") as sf:
+                                    ppid = sf.read().split()[3]
+                                with open(f"/proc/{ppid}/cmdline", "rb") as pf:
+                                    p_cmd = pf.read().decode("utf-8", errors="replace").replace("\x00", " ")
+                                m_p_prof = re.search(r"multigravity-profiles/([^/]+)/", p_cmd)
+                                if m_p_prof:
+                                    prof = m_p_prof.group(1)
+                                else:
+                                    m_p_mgy = re.search(r"mgy\s+([a-zA-Z0-9_\-]+)", p_cmd)
+                                    if m_p_mgy:
+                                        prof = m_p_mgy.group(1)
+                            except Exception:
+                                pass
+                        if not prof:
+                            prof = "default"
                         if m_cid:
                             cid = m_cid.group(1)
                             running_pids[cid] = {"pid": int(pid), "profile": prof}
@@ -237,9 +254,26 @@ def _poll_scan_sync(handled_map, handled_quotas, last_mtimes=None):
                         m_prof = re.search(r"multigravity-profiles/([^/]+)/", cmdline)
                         if not m_prof:
                             m_mgy = re.search(r"mgy\s+([a-zA-Z0-9_\-]+)", cmdline)
-                            prof = m_mgy.group(1) if m_mgy else "default"
+                            prof = m_mgy.group(1) if m_mgy else ""
                         else:
                             prof = m_prof.group(1)
+                        if not prof:
+                            try:
+                                with open(f"{p}/stat") as sf:
+                                    ppid = sf.read().split()[3]
+                                with open(f"/proc/{ppid}/cmdline", "rb") as pf:
+                                    p_cmd = pf.read().decode("utf-8", errors="replace").replace("\x00", " ")
+                                m_p_prof = re.search(r"multigravity-profiles/([^/]+)/", p_cmd)
+                                if m_p_prof:
+                                    prof = m_p_prof.group(1)
+                                else:
+                                    m_p_mgy = re.search(r"mgy\s+([a-zA-Z0-9_\-]+)", p_cmd)
+                                    if m_p_mgy:
+                                        prof = m_p_mgy.group(1)
+                            except Exception:
+                                pass
+                        if not prof:
+                            prof = "default"
                         if m_cid:
                             cid = m_cid.group(1)
                             running_pids[cid] = {"pid": int(pid), "profile": prof}
@@ -397,11 +431,6 @@ class SessionMonitor:
             return False
         handled.add(step_index)
         return True
-
-    def unclaim_step(self, conversation_id: str, step_index: int) -> None:
-        """Unclaims a step if network delivery failed, allowing a retry."""
-        if conversation_id in self._handled_conv_steps:
-            self._handled_conv_steps[conversation_id].discard(step_index)
 
     def mark_handled(self, conversation_id: str, step_index: int) -> None:
         """Marks a conversation step as handled."""
@@ -614,19 +643,13 @@ class SessionMonitor:
                     # Atomically claim step to ensure exactly one delivery
                     if self.claim_step(cid, s_idx):
                         logger.info("Delivering prompt response for %s (Step #%s, PID %s)", cid, s_idx, resp.get("pid"))
-                        delivered = False
                         if self._on_task_completed_cb:
                             try:
                                 r = self._on_task_completed_cb(resp, content)
                                 if asyncio.iscoroutine(r):
-                                    delivered = await r
-                                else:
-                                    delivered = bool(r)
+                                    await r
                             except Exception as cb_err:
                                 logger.error("Error in on_task_completed callback: %s", cb_err)
-                        if not delivered:
-                            logger.warning("Delivery failed for %s step #%s (likely network drop), unclaiming to retry on next poll", cid, s_idx)
-                            self.unclaim_step(cid, s_idx)
 
                 # Handle new quota exhaustion errors
                 for q in res.get("new_quotas", []):
