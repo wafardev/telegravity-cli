@@ -21,6 +21,9 @@ RUN_MODE = os.getenv("RUN_MODE", "ssh").strip().lower()
 # Default multigravity profile
 MGY_PROFILE = os.getenv("MGY_PROFILE", "default").strip()
 
+# Default root / working directory for tasks and execution (set via .env on device)
+DEFAULT_WORKING_DIR = os.getenv("DEFAULT_WORKING_DIR", "").strip()
+
 # SSH Target Configuration (used if RUN_MODE == "ssh")
 SSH_USER = os.getenv("SSH_USER", "").strip()
 SSH_HOST = os.getenv("SSH_HOST", "").strip()

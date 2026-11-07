@@ -6,6 +6,7 @@ Integrates multigravity (mgy) task dispatching with real-time session completion
 
 import asyncio
 import html
+import io
 import logging
 from typing import Optional, Set
 from telegram import (
@@ -111,6 +112,57 @@ async def send_chunked_code(
         )
 
 
+async def send_response_or_file(
+    chat_id: int,
+    bot,
+    text: str,
+    header: str = "",
+    filename: str = "response.txt",
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    max_direct_length: int = 2500,
+) -> None:
+    """
+    Delivers response text directly in a Telegram message if <= max_direct_length characters.
+    If very long, sends a preview message and attaches the complete text as a .txt file document.
+    """
+    if not text:
+        text = "(No output text returned)"
+
+    if len(text) <= max_direct_length:
+        escaped = html.escape(text)
+        msg = f"{header}\n<pre><code>{escaped}</code></pre>" if header else f"<pre><code>{escaped}</code></pre>"
+        await bot.send_message(
+            chat_id=chat_id,
+            text=msg,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+    else:
+        # Long response: send preview + document attachment
+        preview_text = text[:800] + "\n\n... [truncated - see attached file for full response] ..."
+        escaped_preview = html.escape(preview_text)
+        preview_msg = (
+            f"{header}\n\n"
+            f"📄 <i>Response is long ({len(text)} characters). Full output attached as text file below.</i>\n\n"
+            f"<b>Preview:</b>\n"
+            f"<pre><code>{escaped_preview}</code></pre>"
+        )
+        await bot.send_message(
+            chat_id=chat_id,
+            text=preview_msg,
+            parse_mode="HTML",
+        )
+
+        doc = io.BytesIO(text.encode("utf-8"))
+        doc.name = filename
+        await bot.send_document(
+            chat_id=chat_id,
+            document=doc,
+            caption=f"📄 {filename} ({len(text)} characters)",
+            reply_markup=reply_markup,
+        )
+
+
 async def on_external_task_completed(conv_info: dict, output_text: str, application) -> None:
     """Notification callback triggered by SessionMonitor when any agy turn completes."""
     title = conv_info.get("title", "Untitled Task")
@@ -135,11 +187,12 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
     # Deliver to all known authorized chats
     for cid_target in list(known_chats):
         try:
-            await send_chunked_code(
+            await send_response_or_file(
                 chat_id=cid_target,
                 bot=application.bot,
                 text=output_text or "(Task finished with no text output)",
                 header=header,
+                filename=f"task_{short_id}.txt",
                 reply_markup=markup,
             )
         except Exception as e:
@@ -165,19 +218,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"<b>Remote CWD:</b> <code>{cwd}</code>\n\n"
         f"<b>Usage:</b>\n"
         f"• <b>Send any message</b> to dispatch an agy task via mgy.\n"
-        f"• <code>/accounts</code> - List all mgy accounts on the device.\n"
-        f"• <code>/instances</code> - List running mgy & agy process PIDs.\n"
-        f"• <code>/quotas</code> - Get all mgy quotas per account.\n"
-        f"• <code>/peek &lt;pid&gt;</code> - Get latest answer or stream from instance.\n"
-        f"• <code>/run &lt;pid&gt; [prompt]</code> - Run a prompt on a specific instance.\n"
-        f"• <code>/new &lt;profile&gt; [conv]</code> - Bind session to profile & conversation.\n"
-        f"• <code>/cancel [pid]</code> - Cancel running task (appends PID).\n"
-        f"• <code>/kill &lt;pid&gt;</code> - Kill any process by PID.\n"
-        f"• <code>/cd &lt;path&gt;</code> - Change target directory.\n"
-        f"• <code>/status</code> - View host and task status."
+        f"• /instances - List running mgy & agy process PIDs.\n"
+        f"• /quotas - Get all mgy quotas per account.\n"
+        f"• /accounts - List all mgy accounts on the device.\n"
+        f"• /peek &lt;pid&gt; - Get latest answer or stream from instance.\n"
+        f"• /run &lt;pid&gt; [prompt] - Run a prompt on a specific instance.\n"
+        f"• /new &lt;profile&gt; [conv] - Bind session to profile & conversation.\n"
+        f"• /cancel [pid] - Cancel running task (appends PID).\n"
+        f"• /kill &lt;pid&gt; - Kill any process by PID.\n"
+        f"• /cd &lt;path&gt; - Change target directory.\n"
+        f"• /status - View host and task status."
     )
+    keyboard = [
+        [
+            InlineKeyboardButton("📋 /instances", callback_data="refresh_instances"),
+            InlineKeyboardButton("📊 /quotas", callback_data="do_quotas"),
+        ],
+        [
+            InlineKeyboardButton("👥 /accounts", callback_data="do_accounts"),
+            InlineKeyboardButton("📈 /status", callback_data="do_status"),
+        ],
+    ]
     if update.message:
-        await update.message.reply_html(welcome_text)
+        await update.message.reply_html(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -310,7 +373,7 @@ def format_peek_view(info: dict) -> tuple[str, InlineKeyboardMarkup]:
         header_lines.append(f"• <b>Session:</b> <code>{html.escape(conv_title or 'Active')}</code>{cid_disp}")
 
     header = "\n".join(header_lines)
-    body_label = "⏳ <b>Streaming output (last sentences):</b>" if is_running else "💬 <b>Latest answer:</b>"
+    body_label = "⏳ <b>Streaming output / Working:</b>" if is_running else "💬 <b>Recent Conversation Context:</b>"
 
     display_text = content.strip() if content else "(No output captured yet)"
     if len(display_text) > 3200:
@@ -475,11 +538,13 @@ async def _wait_for_injected_response(
             if cid:
                 monitor.mark_handled(cid, curr_step)
 
-            await send_chunked_code(
+            final_text = info.get("raw_latest_model") or content
+            await send_response_or_file(
                 chat_id=chat_id,
                 bot=context.bot,
-                text=content,
+                text=final_text,
                 header=header,
+                filename=f"response_{pid}.txt",
                 reply_markup=markup,
             )
             return
@@ -858,6 +923,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             header="📊 <b>mgy quotas:</b>",
         )
 
+    elif data == "do_accounts":
+        output = await runner.get_mgy_list()
+        await send_chunked_code(
+            chat_id=chat_id,
+            bot=context.bot,
+            text=output or "(no accounts found from mgy list)",
+            header="👥 <b>mgy accounts:</b>",
+        )
+
+    elif data == "do_status":
+        session = get_chat_session(chat_id)
+        target_display = f"{SSH_USER}@{SSH_HOST}:{SSH_PORT}" if RUN_MODE == "ssh" else "Local Machine"
+        active_pid_str = f" (PID: <code>{runner.active_pid}</code>)" if runner.active_pid else ""
+        task_status = f"⚡ BUSY{active_pid_str} ({html.escape(runner.current_task or '')})" if runner.is_busy else "🟢 IDLE"
+        active_cid = session.get("conversation_id")
+        cid_str = active_cid[:8] if active_cid else "Default / Latest"
+        code, sys_info, _ = await runner.run_raw("uptime && free -h 2>/dev/null || uname -a", timeout=10)
+        text = (
+            f"📊 <b>System & Daemon Status:</b>\n\n"
+            f"• <b>Target:</b> <code>{target_display}</code>\n"
+            f"• <b>Profile:</b> <code>{session['profile']}</code>\n"
+            f"• <b>Active Conversation:</b> <code>{cid_str}</code>\n"
+            f"• <b>Remote CWD:</b> <code>{runner.current_dir or '~'}</code>\n"
+            f"• <b>Task State:</b> {task_status}\n\n"
+            f"<b>Host Metrics:</b>\n<pre><code>{html.escape(sys_info.strip())}</code></pre>"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+
     elif data.startswith("instance_ready:"):
         pid = data.split(":", 1)[1]
         await query.answer(f"🟢 Instance {pid} is ready (waiting for a prompt).", show_alert=True)
@@ -1098,11 +1191,12 @@ async def _execute_and_reply(
             header = f"⚠️ <b>Quota Limit Reached (profile: {profile})</b>:"
         else:
             header = f"✅ <b>Task Completed (profile: {profile})</b>:"
-        await send_chunked_code(
+        await send_response_or_file(
             chat_id=chat_id,
             bot=context.bot,
             text=output,
             header=header,
+            filename=f"response_{profile}.txt",
         )
 
     except Exception as e:

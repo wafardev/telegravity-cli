@@ -8,6 +8,7 @@ from typing import Optional, Tuple, List, Dict, Callable, Any
 from config import (
     RUN_MODE,
     MGY_PROFILE,
+    DEFAULT_WORKING_DIR,
     SSH_USER,
     SSH_HOST,
     SSH_PORT,
@@ -23,6 +24,18 @@ class MgyRunner:
     def __init__(self, mode: str = RUN_MODE, default_profile: Optional[str] = MGY_PROFILE):
         self.mode = mode
         self.default_profile = default_profile
+        if DEFAULT_WORKING_DIR:
+            if mode == "ssh":
+                self.current_dir = DEFAULT_WORKING_DIR
+            else:
+                expanded = os.path.expanduser(DEFAULT_WORKING_DIR)
+                if os.path.exists(expanded):
+                    self.current_dir = expanded
+                else:
+                    self.current_dir = None
+        else:
+            self.current_dir = None
+
         self.ssh_runner = SSHRunner(
             user=SSH_USER,
             host=SSH_HOST,
@@ -30,7 +43,8 @@ class MgyRunner:
             key_path=SSH_KEY_PATH,
             timeout=SSH_TIMEOUT,
         ) if mode == "ssh" else None
-        self.current_dir: Optional[str] = None
+        if self.ssh_runner and self.current_dir:
+            self.ssh_runner.current_dir = self.current_dir
         self._active_proc: Optional[asyncio.subprocess.Process] = None
         self._active_pid: Optional[int] = None
         self._live_stream: Dict[int, List[str]] = {}
@@ -695,43 +709,90 @@ sys.exit(res.returncode)
             except Exception:
                 pass
 
-        # Extract latest output from transcript
+        # Extract rich dialogue context from transcript
         content = ""
         status = "unknown"
         latest_step = -1
+        latest_model = None
+
         if found_cid:
             tpath = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{found_cid}/.system_generated/logs/transcript.jsonl")
             if os.path.exists(tpath):
                 try:
                     with open(tpath, "r", errors="replace") as f:
                         lines = f.readlines()
-                    for line in reversed(lines):
+                    turns = []
+                    current_turn = {"user": None, "tools": [], "thinking": None, "model": None, "step_index": -1}
+                    for line in lines:
                         try:
                             entry = json.loads(line)
-                            m_type = entry.get("type")
+                            mtype = entry.get("type")
                             s_idx = int(entry.get("step_index", -1))
-                            c_text = entry.get("content", "").strip()
-                            th_text = entry.get("thinking", "").strip()
-                            t_calls = entry.get("tool_calls", [])
-                            if m_type == "PLANNER_RESPONSE":
+                            if mtype == "USER_INPUT":
+                                if current_turn["user"] is not None or current_turn["model"] is not None:
+                                    turns.append(current_turn)
+                                    current_turn = {"user": None, "tools": [], "thinking": None, "model": None, "step_index": -1}
+                                raw = entry.get("content", "")
+                                m = re.search(r"<USER_REQUEST>\s*([\s\S]*?)\s*</USER_REQUEST>", raw)
+                                current_turn["user"] = m.group(1).strip() if m else raw.strip()
+                                current_turn["step_index"] = s_idx
+                            elif mtype == "PLANNER_RESPONSE":
+                                c_text = entry.get("content", "").strip()
+                                th_text = entry.get("thinking", "").strip()
+                                t_calls = entry.get("tool_calls", [])
                                 if c_text:
-                                    content = c_text
-                                    status = "completed"
-                                    latest_step = s_idx
-                                    break
+                                    current_turn["model"] = c_text
+                                    current_turn["step_index"] = s_idx
                                 elif th_text:
-                                    content = f"[Thinking]: {th_text}"
-                                    status = "thinking"
-                                    latest_step = s_idx
-                                    break
-                                elif t_calls:
-                                    names = [t.get("name", "tool") for t in t_calls]
-                                    content = f"[Tool Call]: {', '.join(names)}"
-                                    status = "tool_call"
-                                    latest_step = s_idx
-                                    break
+                                    current_turn["thinking"] = th_text
+                                    current_turn["step_index"] = s_idx
+                                if t_calls:
+                                    for t in t_calls:
+                                        current_turn["tools"].append(t.get("name", "tool"))
+                                    current_turn["step_index"] = s_idx
                         except Exception:
                             pass
+
+                    if current_turn["user"] is not None or current_turn["model"] is not None or current_turn["thinking"] or current_turn["tools"]:
+                        turns.append(current_turn)
+
+                    if turns:
+                        last_t = turns[-1]
+                        latest_step = last_t.get("step_index", -1)
+                        latest_model = last_t.get("model")
+                        if latest_model:
+                            status = "completed"
+                        elif last_t.get("thinking"):
+                            status = "thinking"
+                        elif last_t.get("tools"):
+                            status = "tool_call"
+                        else:
+                            status = "waiting"
+
+                        formatted_blocks = []
+                        for t in turns[-3:]:
+                            parts = []
+                            if t["user"]:
+                                u = t["user"]
+                                if len(u) > 250:
+                                    u = u[:230] + "..."
+                                parts.append(f"👤 User: {u}")
+                            if t["tools"]:
+                                u_tools = list(dict.fromkeys(t["tools"]))
+                                parts.append(f"⚙️ Tools: {', '.join(u_tools[:5])}")
+                            if t["thinking"] and not t["model"]:
+                                parts.append(f"💭 Thinking: {t['thinking'][:180]}...")
+                            if t["model"]:
+                                m = t["model"]
+                                if len(m) > 1200:
+                                    m = m[:1100] + "\n... [truncated for peek - full response sent when finished]"
+                                parts.append(f"🤖 Assistant:\n{m}")
+                            if parts:
+                                formatted_blocks.append("\n".join(parts))
+
+                        content = "\n\n────────────────\n\n".join(formatted_blocks)
+                        if len(content) > 2800:
+                            content = "..." + content[-2700:]
                 except Exception:
                     pass
 
@@ -758,6 +819,7 @@ sys.exit(res.returncode)
             "conversation_id": found_cid,
             "conversation_title": found_title,
             "content": content,
+            "raw_latest_model": latest_model,
             "transcript_status": status,
             "step_index": latest_step,
         }
@@ -801,7 +863,7 @@ sys.exit(res.returncode)
             res = await asyncio.to_thread(self._peek_inspect, pid)
         else:
             import base64
-            inspect_code = """
+            inspect_code = r"""
 import os, sys, json, sqlite3, re
 pid = int(os.environ.get("PEEK_PID", 0))
 found_cid = None
@@ -853,42 +915,85 @@ if os.path.exists(db):
 content = ""
 status = "unknown"
 latest_step = -1
+latest_model = None
 if found_cid:
     tpath = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{found_cid}/.system_generated/logs/transcript.jsonl")
     if os.path.exists(tpath):
         try:
             with open(tpath, "r", errors="replace") as f:
                 lines = f.readlines()
-            for line in reversed(lines):
+            turns = []
+            cur_turn = {"user": None, "tools": [], "thinking": None, "model": None, "step_index": -1}
+            for line in lines:
                 try:
                     entry = json.loads(line)
-                    m_type = entry.get("type")
+                    mtype = entry.get("type")
                     s_idx = int(entry.get("step_index", -1))
-                    c_text = entry.get("content", "").strip()
-                    th_text = entry.get("thinking", "").strip()
-                    t_calls = entry.get("tool_calls", [])
-                    if m_type == "PLANNER_RESPONSE":
+                    if mtype == "USER_INPUT":
+                        if cur_turn["user"] is not None or cur_turn["model"] is not None:
+                            turns.append(cur_turn)
+                            cur_turn = {"user": None, "tools": [], "thinking": None, "model": None, "step_index": -1}
+                        raw = entry.get("content", "")
+                        m = re.search(r"<USER_REQUEST>\s*([\s\S]*?)\s*</USER_REQUEST>", raw)
+                        cur_turn["user"] = m.group(1).strip() if m else raw.strip()
+                        cur_turn["step_index"] = s_idx
+                    elif mtype == "PLANNER_RESPONSE":
+                        c_text = entry.get("content", "").strip()
+                        th_text = entry.get("thinking", "").strip()
+                        t_calls = entry.get("tool_calls", [])
                         if c_text:
-                            content = c_text
-                            status = "completed"
-                            latest_step = s_idx
-                            break
+                            cur_turn["model"] = c_text
+                            cur_turn["step_index"] = s_idx
                         elif th_text:
-                            content = f"[Thinking]: {th_text}"
-                            status = "thinking"
-                            latest_step = s_idx
-                            break
-                        elif t_calls:
-                            names = [t.get("name", "tool") for t in t_calls]
-                            content = f"[Tool Call]: {', '.join(names)}"
-                            status = "tool_call"
-                            latest_step = s_idx
-                            break
+                            cur_turn["thinking"] = th_text
+                            cur_turn["step_index"] = s_idx
+                        if t_calls:
+                            for t in t_calls:
+                                cur_turn["tools"].append(t.get("name", "tool"))
+                            cur_turn["step_index"] = s_idx
                 except Exception:
                     pass
+            if cur_turn["user"] is not None or cur_turn["model"] is not None or cur_turn["thinking"] or cur_turn["tools"]:
+                turns.append(cur_turn)
+
+            if turns:
+                last_t = turns[-1]
+                latest_step = last_t.get("step_index", -1)
+                latest_model = last_t.get("model")
+                if latest_model:
+                    status = "completed"
+                elif last_t.get("thinking"):
+                    status = "thinking"
+                elif last_t.get("tools"):
+                    status = "tool_call"
+                else:
+                    status = "waiting"
+
+                blocks = []
+                for t in turns[-3:]:
+                    parts = []
+                    if t["user"]:
+                        u = t["user"]
+                        if len(u) > 250:
+                            u = u[:230] + "..."
+                        parts.append(f"👤 User: {u}")
+                    if t["tools"]:
+                        parts.append(f"⚙️ Tools: {', '.join(list(dict.fromkeys(t['tools']))[:5])}")
+                    if t["thinking"] and not t["model"]:
+                        parts.append(f"💭 Thinking: {t['thinking'][:180]}...")
+                    if t["model"]:
+                        m = t["model"]
+                        if len(m) > 1200:
+                            m = m[:1100] + "\\n... [truncated for peek - full response sent when finished]"
+                        parts.append(f"🤖 Assistant:\\n{m}")
+                    if parts:
+                        blocks.append("\\n".join(parts))
+                content = "\\n\\n────────────────\\n\\n".join(blocks)
+                if len(content) > 2800:
+                    content = "..." + content[-2700:]
         except Exception:
             pass
-print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_title": found_title, "content": content, "transcript_status": status, "step_index": latest_step}))
+print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_title": found_title, "content": content, "raw_latest_model": latest_model, "transcript_status": status, "step_index": latest_step}))
 """
             b64_script = base64.b64encode(inspect_code.strip().encode()).decode()
             code_p, out_p, _ = await self.run_raw(f"PEEK_PID={pid} python3 -c \"import base64; exec(base64.b64decode('{b64_script}'))\"", timeout=8)
@@ -911,6 +1016,7 @@ print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_tit
                 "conversation_id": res.get("conversation_id"),
                 "conversation_title": res.get("conversation_title"),
                 "content": res_content or ("(Waiting for first output from prompt...)" if is_running else "(No recent answer found)"),
+                "raw_latest_model": res.get("raw_latest_model"),
                 "step_index": res.get("step_index", -1),
                 "transcript_status": res.get("transcript_status", "unknown"),
             }
