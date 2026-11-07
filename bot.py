@@ -896,7 +896,7 @@ async def conversations_command(update: Update, context: ContextTypes.DEFAULT_TY
         if c_id:
             active_instances[c_id] = inst
 
-    lines = ["📁 <b>Imported Conversations:</b>\n"]
+    lines = ["📁 <b>Imported Conversations:</b>"]
     keyboard = []
 
     for c in convs:
@@ -923,12 +923,11 @@ async def conversations_command(update: Update, context: ContextTypes.DEFAULT_TY
         lines.append(
             f"• <b><code>{cid[:8]}</code></b> — {size_mb} MB ({steps:,} steps)\n"
             f"  Status: {st_line}\n"
-            f"  Prompt: <i>{title}</i>\n"
+            f"  Prompt: <i>{title}</i>"
         )
         keyboard.append(btn_row)
 
-    lines.append("<i>Legend: 🟢 Not Used | 🔴 Used by an instance</i>\n<i>Click below to select or peek:</i>")
-    text = "\n".join(lines)
+    text = "\n\n".join(lines)
     markup = InlineKeyboardMarkup(keyboard)
 
     if update.message:
