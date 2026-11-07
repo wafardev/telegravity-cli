@@ -353,6 +353,51 @@ print("OK")
                         profiles.append({"name": name, "email": email})
         return profiles
 
+    async def get_imported_conversations(self) -> List[Dict[str, Any]]:
+        """Scans for conversations imported from external archives (.conversation_summary.json)."""
+        b64_script = (
+            "aW1wb3J0IGdsb2IsIGpzb24sIG9zLCByZQoKcmVzdWx0cyA9IFtdCmZvciBzdW1fcGF0aCBpbiBnbG9iLmdsb2Iob3MucGF0aC"
+            "5leHBhbmR1c2VyKCJ+Ly5nZW1pbmkvYW50aWdyYXZpdHktY2xpL2JyYWluLyovLmNvbnZlcnNhdGlvbl9zdW1tYXJ5Lmpzb24i"
+            "KSk6CiAgICB0cnk6CiAgICAgICAgY29udl9kaXIgPSBvcy5wYXRoLmRpcm5hbWUoc3VtX3BhdGgpCiAgICAgICAgY29udl9p"
+            "ZCA9IG9zLnBhdGguYmFzZW5hbWUoY29udl9kaXIpCiAgICAgICAgd2l0aCBvcGVuKHN1bV9wYXRoLCAiciIsIGVuY29kaW5n"
+            "PSJ1dGYtOCIpIGFzIGY6CiAgICAgICAgICAgIGRhdGEgPSBqc29uLmxvYWQoZikKICAgICAgICAKICAgICAgICBkYl9wYXRo"
+            "ID0gb3MucGF0aC5leHBhbmR1c2VyKGYifi8uZ2VtaW5pL2FudGlncmF2aXR5LWNsaS9jb252ZXJzYXRpb25zL3tjb252X2lk"
+            "fS5kYiIpCiAgICAgICAgZGJfc2l6ZSA9IG9zLnBhdGguZ2V0c2l6ZShkYl9wYXRoKSBpZiBvcy5wYXRoLmV4aXN0cyhkYl9w"
+            "YXRoKSBlbHNlIDAKICAgICAgICBicmFpbl9zaXplID0gc3VtKG9zLnBhdGguZ2V0c2l6ZShvcy5wYXRoLmpvaW4ociwgZmls"
+            "ZSkpIGZvciByLCBkLCBmaWxlcyBpbiBvcy53YWxrKGNvbnZfZGlyKSBmb3IgZmlsZSBpbiBmaWxlcykKICAgICAgICB0b3Rh"
+            "bF9zaXplID0gZGJfc2l6ZSArIGJyYWluX3NpemUKICAgICAgICAKICAgICAgICB0aXRsZSA9IGRhdGEuZ2V0KCJ0aXRsZSIp"
+            "IG9yIGRhdGEuZ2V0KCJjdXN0b21fbmFtZSIpIG9yICIiCiAgICAgICAgaWYgbm90IHRpdGxlOgogICAgICAgICAgICB0X3Bh"
+            "dGggPSBvcy5wYXRoLmpvaW4oY29udl9kaXIsICIuc3lzdGVtX2dlbmVyYXRlZCIsICJsb2dzIiwgInRyYW5zY3JpcHQuanNv"
+            "bmwiKQogICAgICAgICAgICBpZiBvcy5wYXRoLmV4aXN0cyh0X3BhdGgpOgogICAgICAgICAgICAgICAgdHJ5OgogICAgICAg"
+            "ICAgICAgICAgICAfd2l0aCBvcGVuKHRfcGF0aCwgInIiLCBlbmNvZGluZz0idXRmLTgiKSBhcyB0ZjoKICAgICAgICAgICAg"
+            "ICAgICAgICAgICBmb3IgbGluZSBpbiB0ZjoKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHN0ZXAgPSBqc29uLmxvYWRz"
+            "KGxpbmUpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiBzdGVwLmdldCgidHlwZSIpID09ICJVU0VSX0lOUFVUIjoK"
+            "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBjID0gc3RlcC5nZXQoImNvbnRlbnQiLCAiIikKICAgICAgICAgICAg"
+            "ICAgICAgICAgICAgICAgICAgICBjID0gcmUuc3ViKHIiPFVTRVJfUkVRVUVTVD58PCEtLS4qPy0tPnw8L1VTRVJfUkVRVUVT"
+            "VD4iLCAiIiwgYykuc3RyaXAoKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGZpcnN0X2wgPSBjLnNwbGl0bGlu"
+            "ZXMoKVswXS5zdHJpcCgpIGlmIGMuc3BsaXRsaW5lcygpIGVsc2UgIiIKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+            "ICBpZiBmaXJzdF9sOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0aXRsZSA9IChmaXJzdF9sWzo1MF0g"
+            "KyAiLi4uIikgaWYgbGVuKGZpcnN0X2wpID4gNTAgZWxzZSBmaXJzdF9sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+            "ICAgICAgYnJlYWsKICAgICAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgICAgICAgICAgcGFzcwoi"
+            "ICAgICAgIGlmIG5vdCB0aXRsZToKICAgICAgICAgICAgdGl0bGUgPSAiKHVudGl0bGVkKSIKICAgICAgICAKICAgICAgICBz"
+            "dGVwcyA9IGRhdGEuZ2V0KCJzdGVwX2NvdW50Iikgb3IgMAogICAgICAgIAogICAgICAgIHJlc3VsdHMuYXBwZW5kKHsKICAg"
+            "ICAgICAgICAgImlkIjogY29udl9pZCwKICAgICAgICAgICAgInRpdGxlIjogdGl0bGUsCiAgICAgICAgICAgICJzdGVwX2Nv"
+            "dW50Ijogc3RlcHMsCiAgICAgICAgICAgICJ0b3RhbF9zaXplX21iIjogcm91bmQodG90YWxfc2l6ZSAvICgxMDI0ICogMTAy"
+            "NCksIDEpLAogICAgICAgICAgICAibGFzdF9tb2RpZmllZCI6IGRhdGEuZ2V0KCJsYXN0X21vZGlmaWVkX3RpbWUiLCAiIiks"
+            "CiAgICAgICAgfSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcGFzcwoKcmVzdWx0cy5zb3J0KGtleT1sYW1iZGEg"
+            "eDogeC5nZXQoInRvdGFsX3NpemVfbWIiLCAwKSwgcmV2ZXJzZT1UcnVlKQpwcmludChqc29uLmR1bXBzKHJlc3VsdHMpKQ=="
+        )
+        cmd = f'python3 -c "import base64; exec(base64.b64decode(\'{b64_script}\').decode(\'utf-8\'))"'
+        code, out, _ = await self.run_raw(cmd, timeout=30)
+        if code == 0 and out.strip():
+            try:
+                data = json.loads(out.strip())
+                if isinstance(data, list):
+                    return data
+            except Exception:
+                pass
+        return []
+
     async def get_quotas(self) -> str:
         """Fetches quota details across profiles via 'mgy quotas'."""
         code, out, err = await self.run_raw(f"{self.mgy_bin} quotas", timeout=60)

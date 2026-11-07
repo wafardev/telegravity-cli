@@ -221,6 +221,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• /instances - List running mgy & agy process PIDs.\n"
         f"• /quotas - Get all mgy quotas per account.\n"
         f"• /accounts - List all mgy accounts on the device.\n"
+        f"• /conversations - List imported conversations.\n"
         f"• /peek &lt;pid&gt; - Get latest answer or stream from instance.\n"
         f"• /run &lt;pid&gt; [prompt] - Run a prompt on a specific instance.\n"
         f"• /new &lt;profile&gt; [conv] - Bind session to profile & conversation.\n"
@@ -868,6 +869,42 @@ async def pwd_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_html(f"📂 Current directory: <code>{cwd}</code>")
 
 
+async def conversations_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lists imported conversations and allows selecting one."""
+    if not await check_auth_or_reject(update):
+        return
+
+    if update.message:
+        await update.message.reply_chat_action(ChatAction.TYPING)
+
+    convs = await runner.get_imported_conversations()
+    if not convs:
+        text = "📁 <b>No imported conversations found on the device.</b>\n<i>Only externally imported archives are listed here.</i>"
+        if update.message:
+            await update.message.reply_html(text)
+        return
+
+    lines = ["📁 <b>Imported Conversations:</b>\n"]
+    keyboard = []
+    for c in convs:
+        cid = c["id"]
+        title = html.escape(c.get("title", "(untitled)"))
+        steps = c.get("step_count", 0)
+        size_mb = c.get("total_size_mb", 0)
+        lines.append(
+            f"• <b><code>{cid[:8]}</code></b> — {size_mb} MB ({steps:,} steps)\n"
+            f"  <i>{title}</i>"
+        )
+        keyboard.append([InlineKeyboardButton(f"💬 Select {cid[:8]}", callback_data=f"resume:{cid}")])
+
+    lines.append("\n<i>Click below to pin session to an imported conversation:</i>")
+    text = "\n".join(lines)
+    markup = InlineKeyboardMarkup(keyboard)
+
+    if update.message:
+        await update.message.reply_html(text, reply_markup=markup)
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
@@ -1205,6 +1242,7 @@ async def post_init(application) -> None:
         BotCommand("accounts", "List all mgy accounts on the device."),
         BotCommand("instances", "List active mgy / agy PIDs and status"),
         BotCommand("quotas", "Get all mgy quotas per account."),
+        BotCommand("conversations", "List imported conversations"),
         BotCommand("peek", "Get latest answer/stream: /peek <pid>"),
         BotCommand("run", "Run prompt on instance: /run <pid> [prompt]"),
         BotCommand("new", "Bind session: /new <profile> [conv]"),
@@ -1256,6 +1294,7 @@ def main() -> None:
     app.add_handler(CommandHandler("list", accounts_command))
     app.add_handler(CommandHandler("instances", instances_command))
     app.add_handler(CommandHandler("quotas", quotas_command))
+    app.add_handler(CommandHandler("conversations", conversations_command))
     app.add_handler(CommandHandler("peek", peek_command))
     app.add_handler(CommandHandler("tail", peek_command))
     app.add_handler(CommandHandler("output", peek_command))
