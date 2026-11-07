@@ -870,34 +870,64 @@ async def pwd_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def conversations_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lists imported conversations and allows selecting one."""
+    """Lists imported conversations, showing whether they are currently used by an instance."""
     if not await check_auth_or_reject(update):
         return
 
     if update.message:
         await update.message.reply_chat_action(ChatAction.TYPING)
 
-    convs = await runner.get_imported_conversations()
+    # Fetch imported conversations and running instances concurrently
+    convs, instances = await asyncio.gather(
+        runner.get_imported_conversations(),
+        runner.get_instances(),
+    )
+
     if not convs:
         text = "📁 <b>No imported conversations found on the device.</b>\n<i>Only externally imported archives are listed here.</i>"
         if update.message:
             await update.message.reply_html(text)
         return
 
+    # Map conversation_id -> instance
+    active_instances: Dict[str, Dict[str, Any]] = {}
+    for inst in instances:
+        c_id = inst.get("conversation_id")
+        if c_id:
+            active_instances[c_id] = inst
+
     lines = ["📁 <b>Imported Conversations:</b>\n"]
     keyboard = []
+
     for c in convs:
         cid = c["id"]
         title = html.escape(c.get("title", "(untitled)"))
         steps = c.get("step_count", 0)
         size_mb = c.get("total_size_mb", 0)
+        inst = active_instances.get(cid)
+
+        if inst:
+            p = inst.get("pid")
+            prof = html.escape(inst.get("profile", "default"))
+            st_line = f"🔴 <b>In Use</b> (PID <code>{p}</code> — <b>{prof}</b>)"
+            btn_row = [
+                InlineKeyboardButton(f"🔴 Select {cid[:8]}", callback_data=f"resume:{cid}"),
+                InlineKeyboardButton(f"👁️ Peek {p}", callback_data=f"peek:{p}"),
+            ]
+        else:
+            st_line = "🟢 <b>Not Used</b> (Idle)"
+            btn_row = [
+                InlineKeyboardButton(f"🟢 Select {cid[:8]}", callback_data=f"resume:{cid}"),
+            ]
+
         lines.append(
             f"• <b><code>{cid[:8]}</code></b> — {size_mb} MB ({steps:,} steps)\n"
-            f"  <i>{title}</i>"
+            f"  Status: {st_line}\n"
+            f"  Prompt: <i>{title}</i>\n"
         )
-        keyboard.append([InlineKeyboardButton(f"💬 Select {cid[:8]}", callback_data=f"resume:{cid}")])
+        keyboard.append(btn_row)
 
-    lines.append("\n<i>Click below to pin session to an imported conversation:</i>")
+    lines.append("<i>Legend: 🟢 Not Used | 🔴 Used by an instance</i>\n<i>Click below to select or peek:</i>")
     text = "\n".join(lines)
     markup = InlineKeyboardMarkup(keyboard)
 

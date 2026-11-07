@@ -83,9 +83,9 @@ if not output:
                 log_lines = f.readlines()
             for l in reversed(log_lines[-80:]):
                 if "RESOURCE_EXHAUSTED" in l or "quota reached" in l:
-                    m = re.search(r"(Individual quota reached[^\n\r]+)", l)
-                    if m:
-                        output = f"⚠️ {m.group(1).strip()}"
+                    match_quota = re.search(r"(Individual quota reached[^\n\r]+)", l)
+                    if match_quota:
+                        output = "⚠️ " + match_quota.group(1).strip()
                         break
         except:
             pass

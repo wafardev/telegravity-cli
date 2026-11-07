@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import glob
 import json
 import os
 import re
@@ -355,40 +356,93 @@ print("OK")
 
     async def get_imported_conversations(self) -> List[Dict[str, Any]]:
         """Scans for conversations imported from external archives (.conversation_summary.json)."""
-        b64_script = (
-            "aW1wb3J0IGdsb2IsIGpzb24sIG9zLCByZQoKcmVzdWx0cyA9IFtdCmZvciBzdW1fcGF0aCBpbiBnbG9iLmdsb2Iob3MucGF0aC"
-            "5leHBhbmR1c2VyKCJ+Ly5nZW1pbmkvYW50aWdyYXZpdHktY2xpL2JyYWluLyovLmNvbnZlcnNhdGlvbl9zdW1tYXJ5Lmpzb24i"
-            "KSk6CiAgICB0cnk6CiAgICAgICAgY29udl9kaXIgPSBvcy5wYXRoLmRpcm5hbWUoc3VtX3BhdGgpCiAgICAgICAgY29udl9p"
-            "ZCA9IG9zLnBhdGguYmFzZW5hbWUoY29udl9kaXIpCiAgICAgICAgd2l0aCBvcGVuKHN1bV9wYXRoLCAiciIsIGVuY29kaW5n"
-            "PSJ1dGYtOCIpIGFzIGY6CiAgICAgICAgICAgIGRhdGEgPSBqc29uLmxvYWQoZikKICAgICAgICAKICAgICAgICBkYl9wYXRo"
-            "ID0gb3MucGF0aC5leHBhbmR1c2VyKGYifi8uZ2VtaW5pL2FudGlncmF2aXR5LWNsaS9jb252ZXJzYXRpb25zL3tjb252X2lk"
-            "fS5kYiIpCiAgICAgICAgZGJfc2l6ZSA9IG9zLnBhdGguZ2V0c2l6ZShkYl9wYXRoKSBpZiBvcy5wYXRoLmV4aXN0cyhkYl9w"
-            "YXRoKSBlbHNlIDAKICAgICAgICBicmFpbl9zaXplID0gc3VtKG9zLnBhdGguZ2V0c2l6ZShvcy5wYXRoLmpvaW4ociwgZmls"
-            "ZSkpIGZvciByLCBkLCBmaWxlcyBpbiBvcy53YWxrKGNvbnZfZGlyKSBmb3IgZmlsZSBpbiBmaWxlcykKICAgICAgICB0b3Rh"
-            "bF9zaXplID0gZGJfc2l6ZSArIGJyYWluX3NpemUKICAgICAgICAKICAgICAgICB0aXRsZSA9IGRhdGEuZ2V0KCJ0aXRsZSIp"
-            "IG9yIGRhdGEuZ2V0KCJjdXN0b21fbmFtZSIpIG9yICIiCiAgICAgICAgaWYgbm90IHRpdGxlOgogICAgICAgICAgICB0X3Bh"
-            "dGggPSBvcy5wYXRoLmpvaW4oY29udl9kaXIsICIuc3lzdGVtX2dlbmVyYXRlZCIsICJsb2dzIiwgInRyYW5zY3JpcHQuanNv"
-            "bmwiKQogICAgICAgICAgICBpZiBvcy5wYXRoLmV4aXN0cyh0X3BhdGgpOgogICAgICAgICAgICAgICAgdHJ5OgogICAgICAg"
-            "ICAgICAgICAgICAfd2l0aCBvcGVuKHRfcGF0aCwgInIiLCBlbmNvZGluZz0idXRmLTgiKSBhcyB0ZjoKICAgICAgICAgICAg"
-            "ICAgICAgICAgICBmb3IgbGluZSBpbiB0ZjoKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHN0ZXAgPSBqc29uLmxvYWRz"
-            "KGxpbmUpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiBzdGVwLmdldCgidHlwZSIpID09ICJVU0VSX0lOUFVUIjoK"
-            "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBjID0gc3RlcC5nZXQoImNvbnRlbnQiLCAiIikKICAgICAgICAgICAg"
-            "ICAgICAgICAgICAgICAgICAgICBjID0gcmUuc3ViKHIiPFVTRVJfUkVRVUVTVD58PCEtLS4qPy0tPnw8L1VTRVJfUkVRVUVT"
-            "VD4iLCAiIiwgYykuc3RyaXAoKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGZpcnN0X2wgPSBjLnNwbGl0bGlu"
-            "ZXMoKVswXS5zdHJpcCgpIGlmIGMuc3BsaXRsaW5lcygpIGVsc2UgIiIKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
-            "ICBpZiBmaXJzdF9sOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0aXRsZSA9IChmaXJzdF9sWzo1MF0g"
-            "KyAiLi4uIikgaWYgbGVuKGZpcnN0X2wpID4gNTAgZWxzZSBmaXJzdF9sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
-            "ICAgICAgYnJlYWsKICAgICAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgICAgICAgICAgcGFzcwoi"
-            "ICAgICAgIGlmIG5vdCB0aXRsZToKICAgICAgICAgICAgdGl0bGUgPSAiKHVudGl0bGVkKSIKICAgICAgICAKICAgICAgICBz"
-            "dGVwcyA9IGRhdGEuZ2V0KCJzdGVwX2NvdW50Iikgb3IgMAogICAgICAgIAogICAgICAgIHJlc3VsdHMuYXBwZW5kKHsKICAg"
-            "ICAgICAgICAgImlkIjogY29udl9pZCwKICAgICAgICAgICAgInRpdGxlIjogdGl0bGUsCiAgICAgICAgICAgICJzdGVwX2Nv"
-            "dW50Ijogc3RlcHMsCiAgICAgICAgICAgICJ0b3RhbF9zaXplX21iIjogcm91bmQodG90YWxfc2l6ZSAvICgxMDI0ICogMTAy"
-            "NCksIDEpLAogICAgICAgICAgICAibGFzdF9tb2RpZmllZCI6IGRhdGEuZ2V0KCJsYXN0X21vZGlmaWVkX3RpbWUiLCAiIiks"
-            "CiAgICAgICAgfSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcGFzcwoKcmVzdWx0cy5zb3J0KGtleT1sYW1iZGEg"
-            "eDogeC5nZXQoInRvdGFsX3NpemVfbWIiLCAwKSwgcmV2ZXJzZT1UcnVlKQpwcmludChqc29uLmR1bXBzKHJlc3VsdHMpKQ=="
+        def _scan_sync() -> List[Dict[str, Any]]:
+            results = []
+            pattern = os.path.expanduser("~/.gemini/antigravity-cli/brain/*/.conversation_summary.json")
+            for sum_path in glob.glob(pattern):
+                try:
+                    conv_dir = os.path.dirname(sum_path)
+                    conv_id = os.path.basename(conv_dir)
+                    with open(sum_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+
+                    db_path = os.path.expanduser(f"~/.gemini/antigravity-cli/conversations/{conv_id}.db")
+                    db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+                    brain_size = sum(
+                        os.path.getsize(os.path.join(r, file))
+                        for r, d, files in os.walk(conv_dir)
+                        for file in files
+                    )
+                    total_size = db_size + brain_size
+
+                    title = data.get("title") or data.get("custom_name") or ""
+                    if not title:
+                        t_path = os.path.join(conv_dir, ".system_generated", "logs", "transcript.jsonl")
+                        if os.path.exists(t_path):
+                            try:
+                                with open(t_path, "r", encoding="utf-8") as tf:
+                                    for line in tf:
+                                        step = json.loads(line)
+                                        if step.get("type") == "USER_INPUT":
+                                            c = step.get("content", "")
+                                            c = re.sub(r"<USER_REQUEST>|<!--.*?-->|</USER_REQUEST>", "", c).strip()
+                                            lines_c = c.splitlines()
+                                            first_l = lines_c[0].strip() if lines_c else ""
+                                            if first_l:
+                                                title = (first_l[:50] + "...") if len(first_l) > 50 else first_l
+                                                break
+                            except Exception:
+                                pass
+                    if not title:
+                        title = "(untitled)"
+
+                    steps = data.get("step_count") or 0
+
+                    results.append({
+                        "id": conv_id,
+                        "title": title,
+                        "step_count": steps,
+                        "total_size_mb": round(total_size / (1024 * 1024), 1),
+                        "last_modified": data.get("last_modified_time", ""),
+                    })
+                except Exception:
+                    pass
+
+            results.sort(key=lambda x: x.get("total_size_mb", 0), reverse=True)
+            return results
+
+        if self.mode == "local":
+            return await asyncio.to_thread(_scan_sync)
+
+        # SSH mode execution
+        script_code = (
+            "import glob, json, os, re\n"
+            "results = []\n"
+            "for s in glob.glob(os.path.expanduser('~/.gemini/antigravity-cli/brain/*/.conversation_summary.json')):\n"
+            "    try:\n"
+            "        cdir = os.path.dirname(s); cid = os.path.basename(cdir)\n"
+            "        with open(s, 'r', encoding='utf-8') as f: d = json.load(f)\n"
+            "        db = os.path.expanduser(f'~/.gemini/antigravity-cli/conversations/{cid}.db')\n"
+            "        dbs = os.path.getsize(db) if os.path.exists(db) else 0\n"
+            "        bs = sum(os.path.getsize(os.path.join(r, fl)) for r, _, fs in os.walk(cdir) for fl in fs)\n"
+            "        t = d.get('title') or d.get('custom_name') or ''\n"
+            "        if not t:\n"
+            "            tp = os.path.join(cdir, '.system_generated', 'logs', 'transcript.jsonl')\n"
+            "            if os.path.exists(tp):\n"
+            "                with open(tp, 'r', encoding='utf-8') as tf:\n"
+            "                    for line in tf:\n"
+            "                        st = json.loads(line)\n"
+            "                        if st.get('type') == 'USER_INPUT':\n"
+            "                            c = re.sub(r'<USER_REQUEST>|<!--.*?-->|</USER_REQUEST>', '', st.get('content', '')).strip()\n"
+            "                            t = (c.splitlines()[0][:50] + '...') if c.splitlines() else '(untitled)'\n"
+            "                            break\n"
+            "        results.append({'id': cid, 'title': t or '(untitled)', 'step_count': d.get('step_count', 0), 'total_size_mb': round((dbs+bs)/(1024*1024), 1)})\n"
+            "    except: pass\n"
+            "results.sort(key=lambda x: x.get('total_size_mb', 0), reverse=True)\n"
+            "print(json.dumps(results))\n"
         )
-        cmd = f'python3 -c "import base64; exec(base64.b64decode(\'{b64_script}\').decode(\'utf-8\'))"'
-        code, out, _ = await self.run_raw(cmd, timeout=30)
+        b64 = base64.b64encode(script_code.encode("utf-8")).decode("ascii")
+        code, out, _ = await self.run_raw(f"python3 -c \"import base64; exec(base64.b64decode('{b64}').decode('utf-8'))\"", timeout=20)
         if code == 0 and out.strip():
             try:
                 data = json.loads(out.strip())
