@@ -412,7 +412,7 @@ print("OK")
                     pass
 
             # Explicitly include known/imported conversations if not yet matched
-            known_ids = ["bfdee43a-3ed6-4213-9bc1-860d2e9697d3"]
+            known_ids = ["04a5d409-d7f6-4abd-9b40-ce321bc65d35", "bfdee43a-3ed6-4213-9bc1-860d2e9697d3"]
             for kid in known_ids:
                 if kid not in seen_ids:
                     k_brain = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{kid}")
@@ -455,9 +455,11 @@ print("OK")
         script_code = (
             "import glob, json, os, re\n"
             "results = []\n"
+            "seen = set()\n"
             "for s in glob.glob(os.path.expanduser('~/.gemini/antigravity-cli/brain/*/.conversation_summary.json')):\n"
             "    try:\n"
             "        cdir = os.path.dirname(s); cid = os.path.basename(cdir)\n"
+            "        seen.add(cid)\n"
             "        with open(s, 'r', encoding='utf-8') as f: d = json.load(f)\n"
             "        db = os.path.expanduser(f'~/.gemini/antigravity-cli/conversations/{cid}.db')\n"
             "        dbs = os.path.getsize(db) if os.path.exists(db) else 0\n"
@@ -475,6 +477,26 @@ print("OK")
             "                            break\n"
             "        results.append({'id': cid, 'title': t or '(untitled)', 'step_count': d.get('step_count', 0), 'total_size_mb': round((dbs+bs)/(1024*1024), 1)})\n"
             "    except: pass\n"
+            "for kid in ['04a5d409-d7f6-4abd-9b40-ce321bc65d35', 'bfdee43a-3ed6-4213-9bc1-860d2e9697d3']:\n"
+            "    if kid not in seen:\n"
+            "        kb = os.path.expanduser(f'~/.gemini/antigravity-cli/brain/{kid}')\n"
+            "        kd = os.path.expanduser(f'~/.gemini/antigravity-cli/conversations/{kid}.db')\n"
+            "        if os.path.exists(kb) or os.path.exists(kd):\n"
+            "            seen.add(kid)\n"
+            "            dbs = os.path.getsize(kd) if os.path.exists(kd) else 0\n"
+            "            bs = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(kb) for f in fs) if os.path.exists(kb) else 0\n"
+            "            t = ''; steps = 0\n"
+            "            tp = os.path.join(kb, '.system_generated', 'logs', 'transcript.jsonl')\n"
+            "            if os.path.exists(tp):\n"
+            "                try:\n"
+            "                    with open(tp, 'r', encoding='utf-8') as tf:\n"
+            "                        for l in tf:\n"
+            "                            st = json.loads(l); steps = max(steps, st.get('step_index', 0))\n"
+            "                            if not t and st.get('type') == 'USER_INPUT':\n"
+            "                                c = re.sub(r'<USER_REQUEST>|<!--.*?-->|</USER_REQUEST>', '', st.get('content', '')).strip()\n"
+            "                                t = (c.splitlines()[0][:50] + '...') if c.splitlines() else '(untitled)'\n"
+            "                except: pass\n"
+            "            results.append({'id': kid, 'title': t or '(untitled)', 'step_count': steps, 'total_size_mb': round((dbs+bs)/(1024*1024), 1)})\n"
             "results.sort(key=lambda x: x.get('total_size_mb', 0), reverse=True)\n"
             "print(json.dumps(results))\n"
         )
