@@ -5,9 +5,13 @@ Integrates multigravity (mgy) task dispatching with real-time session completion
 """
 
 import asyncio
+import glob
 import html
 import io
 import logging
+import os
+import re
+import time
 from typing import Optional, Set
 from telegram import (
     Update,
@@ -448,24 +452,55 @@ async def _wait_for_injected_response(
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Waits for the interactive instance to complete its turn and delivers the response."""
+    """Waits for the interactive instance to complete its turns and delivers responses as they are produced."""
     poll_count = 0
-    max_polls = 600  # 600 * 0.8s = 480 seconds (8 mins)
+    max_idle_polls = 450  # 450 * 0.8s = 360 seconds of complete inactivity
+    last_seen_step = initial_step
+    last_delivered_content = initial_content
+    responses_delivered = 0
 
-    while poll_count < max_polls:
+    while poll_count < max_idle_polls:
         await asyncio.sleep(0.8)
         poll_count += 1
 
         info = await runner.peek_instance(pid)
         if not info.get("found"):
-            # Process terminated or closed
+            # Check if terminated due to quota limit before reporting termination
+            quota_err = ""
             try:
-                await status_msg.edit_text(
-                    f"⌨️ <b>PID <code>{pid}</code> terminated.</b>\n<b>Prompt:</b> <code>{html.escape(prompt[:80])}</code>",
-                    parse_mode="HTML",
+                cand_logs = (
+                    glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/log/cli-*.log")) +
+                    glob.glob(os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/log/cli-*.log"))
                 )
+                if cand_logs:
+                    latest_log = max(cand_logs, key=os.path.getmtime)
+                    if (time.time() - os.path.getmtime(latest_log)) < 180:
+                        with open(latest_log, "r", errors="replace") as lf:
+                            for line in reversed(lf.readlines()[-80:]):
+                                if "RESOURCE_EXHAUSTED" in line or "quota reached" in line:
+                                    m_q = re.search(r"(Individual quota reached[^\n\r]+)", line)
+                                    if m_q:
+                                        quota_err = m_q.group(1).strip()
+                                        break
             except Exception:
                 pass
+
+            if quota_err:
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas")]])
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ <b>Quota Limit Reached on PID <code>{pid}</code> (<b>{html.escape(profile)}</b>)!</b>\n<pre><code>{html.escape(quota_err)}</code></pre>",
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+            else:
+                try:
+                    await status_msg.edit_text(
+                        f"⌨️ <b>PID <code>{pid}</code> terminated.</b>\n<b>Prompt:</b> <code>{html.escape(prompt[:80])}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
             return
 
         is_depleted = info.get("is_quota_depleted", False)
@@ -473,6 +508,7 @@ async def _wait_for_injected_response(
         status = info.get("transcript_status", "")
         curr_step = info.get("step_index", -1)
         cid = info.get("conversation_id") or initial_cid
+        is_running = info.get("is_running", False)
 
         if is_depleted or "Individual quota reached" in content:
             # Quota exhausted
@@ -480,7 +516,7 @@ async def _wait_for_injected_response(
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas")]])
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"⚠️ <b>Quota Limit Reached on PID <code>{pid}</code>!</b>\n<pre><code>{html.escape(content)}</code></pre>",
+                    text=f"⚠️ <b>Quota Limit Reached on PID <code>{pid}</code> (<b>{html.escape(profile)}</b>)!</b>\n<pre><code>{html.escape(content)}</code></pre>",
                     parse_mode="HTML",
                     reply_markup=markup,
                 )
@@ -488,31 +524,18 @@ async def _wait_for_injected_response(
                 pass
             return
 
-        # Check if new response has finished
+        # Check if new model response has arrived
         new_step_completed = (
-            (curr_step > initial_step and curr_step != -1) or
-            (content and content != initial_content and not content.startswith("[Thinking]") and not content.startswith("[Tool Call]"))
+            (curr_step > last_seen_step and curr_step != -1) or
+            (content and content != last_delivered_content and not content.startswith("[Thinking]") and not content.startswith("[Tool Call]"))
         )
 
-        if new_step_completed and status == "completed" and content and content != "(Waiting for first output from prompt...)":
-            # Update the waiting status message
-            try:
-                buttons = [
-                    [
-                        InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
-                        InlineKeyboardButton(f"🛑 Cancel {pid}", callback_data=f"cancel_task:{pid}"),
-                        InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
-                    ]
-                ]
-                await status_msg.edit_text(
-                    f"⌨️ <b>Injected prompt into PID <code>{pid}</code></b> (<b>{html.escape(profile)}</b>)\n"
-                    f"<b>Prompt:</b> <code>{html.escape(prompt[:100])}</code>\n\n"
-                    f"✅ <i>Response received!</i>",
-                    parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup(buttons),
-                )
-            except Exception:
-                pass
+        final_text = info.get("raw_latest_model") or content
+        if new_step_completed and status == "completed" and final_text and final_text != "(Waiting for first output from prompt...)" and final_text != last_delivered_content:
+            responses_delivered += 1
+            last_seen_step = curr_step
+            last_delivered_content = final_text
+            poll_count = 0  # Reset idle timeout since progress is actively being made!
 
             # Deliver response message to chat
             reply_buttons = [
@@ -523,13 +546,13 @@ async def _wait_for_injected_response(
                 ]
             ]
             markup = InlineKeyboardMarkup(reply_buttons)
-            header = f"💬 <b>Response from PID <code>{pid}</code> (<b>{html.escape(profile)}</b>):</b>"
+            turn_label = f" (Turn #{responses_delivered})" if responses_delivered > 1 else ""
+            header = f"💬 <b>Response from PID <code>{pid}</code> (<b>{html.escape(profile)}</b>){turn_label}:</b>"
 
             # Mark conversation handled in SessionMonitor
             if cid:
                 monitor.mark_handled(cid, curr_step)
 
-            final_text = info.get("raw_latest_model") or content
             await send_response_or_file(
                 chat_id=chat_id,
                 bot=context.bot,
@@ -538,6 +561,38 @@ async def _wait_for_injected_response(
                 filename=f"response_{pid}.txt",
                 reply_markup=markup,
             )
+
+            # Update the status message
+            try:
+                action_buttons = [
+                    [
+                        InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
+                        InlineKeyboardButton(f"🛑 Cancel {pid}", callback_data=f"cancel_task:{pid}"),
+                        InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
+                    ]
+                ]
+                if is_running:
+                    st_text = (
+                        f"⌨️ <b>Injected prompt into PID <code>{pid}</code></b> (<b>{html.escape(profile)}</b>)\n"
+                        f"<b>Prompt:</b> <code>{html.escape(prompt[:100])}</code>\n\n"
+                        f"🔄 <i>Update delivered! Task is still running in background...</i>"
+                    )
+                else:
+                    st_text = (
+                        f"⌨️ <b>Injected prompt into PID <code>{pid}</code></b> (<b>{html.escape(profile)}</b>)\n"
+                        f"<b>Prompt:</b> <code>{html.escape(prompt[:100])}</code>\n\n"
+                        f"✅ <i>Response received (Instance is ready / idle)!</i>"
+                    )
+                await status_msg.edit_text(st_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(action_buttons))
+            except Exception:
+                pass
+
+            # If the instance has finished all execution and returned to idle prompt, stop watching
+            if not is_running:
+                return
+
+        # If the instance returned to idle after delivering at least one response, we can stop watching
+        if responses_delivered > 0 and not is_running:
             return
 
 

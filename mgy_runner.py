@@ -849,22 +849,25 @@ sys.exit(res.returncode)
                     break
 
         # Fallback to latest conversation in database
-        db = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
-        if os.path.exists(db):
-            try:
-                import sqlite3
-                conn = sqlite3.connect(db)
-                if found_cid:
-                    r = conn.execute("SELECT title, not_fully_idle FROM conversation_summaries WHERE conversation_id = ?", (found_cid,)).fetchone()
-                    if r:
-                        found_title = r[0]
-                else:
-                    r = conn.execute("SELECT conversation_id, title, not_fully_idle FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 1").fetchone()
-                    if r:
-                        found_cid = r[0]
-                        found_title = r[1]
-            except Exception:
-                pass
+        cand_dbs = [os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")] + glob.glob(os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/conversation_summaries.db"))
+        for db in cand_dbs:
+            if os.path.exists(db):
+                try:
+                    import sqlite3
+                    conn = sqlite3.connect(db)
+                    if found_cid:
+                        r = conn.execute("SELECT title, not_fully_idle FROM conversation_summaries WHERE conversation_id = ?", (found_cid,)).fetchone()
+                        if r:
+                            found_title = r[0]
+                            break
+                    else:
+                        r = conn.execute("SELECT conversation_id, title, not_fully_idle FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 1").fetchone()
+                        if r:
+                            found_cid = r[0]
+                            found_title = r[1]
+                            break
+                except Exception:
+                    pass
 
         # Extract rich dialogue context from transcript
         content = ""
@@ -873,8 +876,11 @@ sys.exit(res.returncode)
         latest_model = None
 
         if found_cid:
-            tpath = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{found_cid}/.system_generated/logs/transcript.jsonl")
-            if os.path.exists(tpath):
+            cand_t = [
+                os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{found_cid}/.system_generated/logs/transcript.jsonl"),
+            ] + glob.glob(os.path.expanduser(f"~/.config/multigravity-profiles/*/.gemini/antigravity-cli/brain/{found_cid}/.system_generated/logs/transcript.jsonl"))
+            tpath = next((p for p in cand_t if os.path.exists(p)), None)
+            if tpath and os.path.exists(tpath):
                 try:
                     with open(tpath, "r", errors="replace") as f:
                         lines = f.readlines()
@@ -953,23 +959,27 @@ sys.exit(res.returncode)
                 except Exception:
                     pass
 
-        # If no planner response, check if a quota exhaustion error occurred in CLI logs
-        if not content:
-            import glob
-            log_files = sorted(glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/log/cli-*.log")), key=os.path.getmtime, reverse=True)
-            if log_files:
-                try:
-                    with open(log_files[0], "r", errors="replace") as f:
-                        log_lines = f.readlines()
-                    for l in reversed(log_lines[-80:]):
-                        if "RESOURCE_EXHAUSTED" in l or "quota reached" in l:
-                            m = re.search(r"(Individual quota reached[^\n\r]+)", l)
-                            if m:
-                                content = f"⚠️ {m.group(1).strip()}"
-                                status = "quota_exhausted"
-                                break
-                except Exception:
-                    pass
+        # Check if a quota exhaustion error occurred in CLI logs
+        cand_logs = (
+            glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/log/cli-*.log")) +
+            glob.glob(os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/log/cli-*.log"))
+        )
+        log_files = sorted([f for f in cand_logs if os.path.exists(f)], key=os.path.getmtime, reverse=True)
+        if log_files:
+            try:
+                with open(log_files[0], "r", errors="replace") as f:
+                    log_lines = f.readlines()
+                for l in reversed(log_lines[-80:]):
+                    if "RESOURCE_EXHAUSTED" in l or "quota reached" in l:
+                        m = re.search(r"(Individual quota reached[^\n\r]+)", l)
+                        if m:
+                            quota_msg = f"⚠️ {m.group(1).strip()}"
+                            if not content:
+                                content = quota_msg
+                            status = "quota_exhausted"
+                            break
+            except Exception:
+                pass
 
         return {
             "found": True,

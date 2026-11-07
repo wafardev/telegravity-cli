@@ -34,17 +34,22 @@ class SessionMonitor:
         self._on_task_completed_cb = callback
 
     async def get_recent_conversations(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Fetches recent conversations from conversation_summaries.db."""
+        """Fetches recent conversations from conversation_summaries.db across all profiles."""
         query_code = f"""
-import sqlite3, json, os
-db = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
-if not os.path.exists(db):
-    print("[]")
-    exit(0)
-conn = sqlite3.connect(db)
-conn.row_factory = sqlite3.Row
-rows = conn.execute("SELECT conversation_id, title, preview, step_count, status, not_fully_idle, datetime(last_modified_time) as last_mod FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT {limit}").fetchall()
-print(json.dumps([dict(r) for r in rows]))
+import sqlite3, json, os, glob
+dbs = [os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")] + glob.glob(os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/conversation_summaries.db"))
+all_rows = []
+for db in dbs:
+    if os.path.exists(db):
+        try:
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT conversation_id, title, preview, step_count, status, not_fully_idle, datetime(last_modified_time) as last_mod FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT {limit}").fetchall()
+            all_rows.extend([dict(r) for r in rows])
+        except Exception:
+            pass
+all_rows.sort(key=lambda r: r.get("last_mod") or "", reverse=True)
+print(json.dumps(all_rows[:{limit}]))
 """
         cmd = f"python3 -c '{query_code.strip()}'"
         code, out, err = await self.runner.run_raw(cmd, timeout=10)
@@ -60,10 +65,11 @@ print(json.dumps([dict(r) for r in rows]))
         fetch_code = f"""
 import json, os, glob, re
 conv_id = "{conversation_id}"
-path = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{{conv_id}}/.system_generated/logs/transcript.jsonl")
+cand = [os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{{conv_id}}/.system_generated/logs/transcript.jsonl")] + glob.glob(os.path.expanduser(f"~/.config/multigravity-profiles/*/.gemini/antigravity-cli/brain/{{conv_id}}/.system_generated/logs/transcript.jsonl"))
+path = next((p for p in cand if os.path.exists(p)), None)
 output = ""
 
-if os.path.exists(path):
+if path and os.path.exists(path):
     with open(path, "r", errors="replace") as f:
         lines = f.readlines()
         for line in reversed(lines):
@@ -76,7 +82,8 @@ if os.path.exists(path):
                 pass
 
 if not output:
-    log_files = sorted(glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/log/cli-*.log")), key=os.path.getmtime, reverse=True)
+    cand_logs = glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/log/cli-*.log")) + glob.glob(os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/log/cli-*.log"))
+    log_files = sorted([f for f in cand_logs if os.path.exists(f)], key=os.path.getmtime, reverse=True)
     if log_files:
         try:
             with open(log_files[0], "r", errors="replace") as f:
