@@ -443,7 +443,7 @@ sys.exit(res.returncode)
         return False, err_msg
 
     async def kill_process(self, pid: int) -> Tuple[bool, str]:
-        """Kills a process by PID on the target device."""
+        """Kills a process and all its child/descendant processes (e.g. agy under mgy)."""
         if pid <= 1:
             return False, "Invalid PID: cannot kill system processes."
 
@@ -452,21 +452,40 @@ sys.exit(res.returncode)
         if code != 0:
             return False, f"Process {pid} does not exist or has already terminated."
 
-        # Send SIGTERM first
-        await self.run_raw(f"kill -15 {pid} 2>/dev/null", timeout=5)
-        await asyncio.sleep(0.5)
+        # Collect all descendant PIDs recursively so child processes (like agy) aren't orphaned
+        all_to_kill = [pid]
+        stack = [pid]
+        while stack:
+            curr = stack.pop()
+            c_code, c_out, _ = await self.run_raw(f"pgrep -P {curr} 2>/dev/null", timeout=5)
+            if c_code == 0 and c_out.strip():
+                for cp in c_out.strip().split():
+                    if cp.isdigit() and int(cp) not in all_to_kill:
+                        c_val = int(cp)
+                        all_to_kill.append(c_val)
+                        stack.append(c_val)
 
-        # Check if process is gone
+        pids_str = " ".join(str(p) for p in all_to_kill)
+
+        # Send SIGTERM first to entire tree
+        await self.run_raw(f"kill -15 {pids_str} 2>/dev/null", timeout=5)
+        await asyncio.sleep(0.4)
+
+        # Check if root process is gone
         code2, _, _ = await self.run_raw(f"kill -0 {pid} 2>/dev/null", timeout=5)
         if code2 != 0:
-            return True, f"Process {pid} terminated."
+            # Clean up any lingering children with SIGKILL just in case
+            lingering = [p for p in all_to_kill if p != pid]
+            if lingering:
+                await self.run_raw(f"kill -9 {' '.join(str(p) for p in lingering)} 2>/dev/null", timeout=5)
+            return True, f"Process {pid} and its process tree terminated."
 
-        # Force kill with SIGKILL
-        await self.run_raw(f"kill -9 {pid} 2>/dev/null", timeout=5)
+        # Force kill with SIGKILL to all
+        await self.run_raw(f"kill -9 {pids_str} 2>/dev/null", timeout=5)
         await asyncio.sleep(0.3)
         code3, _, _ = await self.run_raw(f"kill -0 {pid} 2>/dev/null", timeout=5)
         if code3 != 0:
-            return True, f"Process {pid} terminated (SIGKILL)."
+            return True, f"Process {pid} and its process tree terminated (SIGKILL)."
 
         return False, f"Failed to terminate process {pid} (permission denied or protected)."
 
