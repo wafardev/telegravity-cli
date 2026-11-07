@@ -910,22 +910,17 @@ async def conversations_command(update: Update, context: ContextTypes.DEFAULT_TY
             p = inst.get("pid")
             prof = html.escape(inst.get("profile", "default"))
             st_line = f"🔴 <b>In Use</b> (PID <code>{p}</code> — <b>{prof}</b>)"
-            btn_row = [
-                InlineKeyboardButton(f"🔴 Select {cid[:8]}", callback_data=f"resume:{cid}"),
-                InlineKeyboardButton(f"👁️ Peek {p}", callback_data=f"peek:{p}"),
-            ]
+            keyboard.append([InlineKeyboardButton(f"🔴 Select {cid}", callback_data=f"resume:{cid}")])
+            keyboard.append([InlineKeyboardButton(f"👁️ Peek PID {p} ({prof})", callback_data=f"peek:{p}")])
         else:
             st_line = "🟢 <b>Not Used</b> (Idle)"
-            btn_row = [
-                InlineKeyboardButton(f"🟢 Select {cid[:8]}", callback_data=f"resume:{cid}"),
-            ]
+            keyboard.append([InlineKeyboardButton(f"🟢 Select {cid}", callback_data=f"resume:{cid}")])
 
         lines.append(
-            f"• <b><code>{cid[:8]}</code></b> — {size_mb} MB ({steps:,} steps)\n"
+            f"• <b><code>{cid}</code></b> — {size_mb} MB ({steps:,} steps)\n"
             f"  Status: {st_line}\n"
             f"  Prompt: <i>{title}</i>"
         )
-        keyboard.append(btn_row)
 
     text = "\n\n".join(lines)
     markup = InlineKeyboardMarkup(keyboard)
@@ -954,7 +949,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             sess = get_chat_session(chat_id)
             sess["conversation_id"] = cid
         await query.edit_message_text(
-            f"🔄 Pinned active conversation to <code>{cid[:8]}</code>.\nNext prompt will resume this conversation.",
+            f"🔄 Pinned active conversation to <code>{cid}</code>.\nNext prompt will resume this conversation.",
             parse_mode="HTML",
         )
 

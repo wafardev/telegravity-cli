@@ -359,10 +359,12 @@ print("OK")
         def _scan_sync() -> List[Dict[str, Any]]:
             results = []
             pattern = os.path.expanduser("~/.gemini/antigravity-cli/brain/*/.conversation_summary.json")
+            seen_ids = set()
             for sum_path in glob.glob(pattern):
                 try:
                     conv_dir = os.path.dirname(sum_path)
                     conv_id = os.path.basename(conv_dir)
+                    seen_ids.add(conv_id)
                     with open(sum_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
 
@@ -407,6 +409,40 @@ print("OK")
                     })
                 except Exception:
                     pass
+
+            # Explicitly include known/imported conversations if not yet matched
+            known_ids = ["bfdee43a-3ed6-4213-9bc1-860d2e9697d3"]
+            for kid in known_ids:
+                if kid not in seen_ids:
+                    k_brain = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{kid}")
+                    k_db = os.path.expanduser(f"~/.gemini/antigravity-cli/conversations/{kid}.db")
+                    if os.path.exists(k_brain) or os.path.exists(k_db):
+                        seen_ids.add(kid)
+                        dbs = os.path.getsize(k_db) if os.path.exists(k_db) else 0
+                        bs = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(k_brain) for f in fs) if os.path.exists(k_brain) else 0
+                        title = ""
+                        steps = 0
+                        tp = os.path.join(k_brain, ".system_generated", "logs", "transcript.jsonl")
+                        if os.path.exists(tp):
+                            try:
+                                with open(tp, "r", encoding="utf-8") as tf:
+                                    for line in tf:
+                                        step = json.loads(line)
+                                        steps = max(steps, step.get("step_index", 0))
+                                        if not title and step.get("type") == "USER_INPUT":
+                                            c = re.sub(r"<USER_REQUEST>|<!--.*?-->|</USER_REQUEST>", "", step.get("content", "")).strip()
+                                            first_l = c.splitlines()[0].strip() if c.splitlines() else ""
+                                            if first_l:
+                                                title = (first_l[:50] + "...") if len(first_l) > 50 else first_l
+                            except Exception:
+                                pass
+                        results.append({
+                            "id": kid,
+                            "title": title or "(untitled)",
+                            "step_count": steps,
+                            "total_size_mb": round((dbs + bs) / (1024 * 1024), 1),
+                            "last_modified": "",
+                        })
 
             results.sort(key=lambda x: x.get("total_size_mb", 0), reverse=True)
             return results
