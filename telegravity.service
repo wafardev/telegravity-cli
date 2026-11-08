@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+KillMode=process
 # Replace 'user' with your Linux username
 User=user
 WorkingDirectory=/home/user/telegravity-cli
