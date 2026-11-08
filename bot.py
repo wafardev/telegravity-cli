@@ -1152,14 +1152,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data.startswith("resume:") or data.startswith("choose_profile_for_conv:"):
         cid = data.split(":", 1)[1]
+        context.user_data["selected_conv_id"] = cid
+        if chat_id:
+            sess = get_chat_session(chat_id)
+            sess["conversation_id"] = cid
+
         profiles = await runner.list_profiles()
         if not profiles:
-            if chat_id:
-                sess = get_chat_session(chat_id)
-                sess["conversation_id"] = cid
+            context.user_data["pending_run"] = {"profile": "default", "conversation_id": cid, "pid": None}
+            cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Prompt", callback_data="cancel_pending_run")]])
             await query.edit_message_text(
-                f"🔄 Pinned active conversation to <code>{cid}</code>.",
+                f"🔄 Active conversation set to <code>{cid[:8]}</code>.\n\n"
+                f"💬 <i>Send the prompt you want to execute:</i>",
                 parse_mode="HTML",
+                reply_markup=cancel_btn,
             )
             return
 
@@ -1167,7 +1173,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         row = []
         for p in profiles:
             p_name = p["name"]
-            row.append(InlineKeyboardButton(p_name, callback_data=f"bind_conv_prof:{cid}:{p_name}"))
+            row.append(InlineKeyboardButton(p_name, callback_data=f"sel_conv_prof:{p_name}"))
             if len(row) == 2:
                 buttons.append(row)
                 row = []
@@ -1176,24 +1182,39 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_prof_select")])
 
         await query.edit_message_text(
-            f"👤 <b>Select a profile to run conversation <code>{cid[:8]}</code>:</b>\n\n"
-            f"<i>Choose which mgy profile / account to bind to this conversation:</i>",
+            f"👤 <b>Select an account / profile to run conversation <code>{cid[:8]}</code>:</b>\n\n"
+            f"<i>Choose which mgy profile to use:</i>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
-    elif data.startswith("bind_conv_prof:"):
-        parts = data.split(":", 2)
-        cid = parts[1]
-        prof_name = parts[2]
+    elif data.startswith("sel_conv_prof:") or data.startswith("bind_conv_prof:"):
+        parts = data.split(":")
+        prof_name = parts[-1]
+        cid = context.user_data.pop("selected_conv_id", None)
+        if not cid and len(parts) > 2:
+            cid = parts[1]
         if chat_id:
             sess = get_chat_session(chat_id)
+            if not cid:
+                cid = sess.get("conversation_id")
             sess["conversation_id"] = cid
             sess["profile"] = prof_name
+
+        context.user_data["pending_run"] = {
+            "profile": prof_name,
+            "conversation_id": cid,
+            "pid": None,
+        }
+        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Prompt", callback_data="cancel_pending_run")]])
+        cid_disp = f" (<code>{cid[:8]}</code>)" if cid else ""
         await query.edit_message_text(
-            f"✅ <b>Bound conversation <code>{cid[:8]}</code> to profile <b>{html.escape(prof_name)}</b>.</b>\n\n"
-            f"Next message you send will be dispatched with this profile and conversation.",
+            f"🚀 <b>Session Configured!</b>\n"
+            f"• <b>Account:</b> <b>{html.escape(prof_name)}</b>\n"
+            f"• <b>Conversation:</b>{cid_disp}\n\n"
+            f"💬 <i>Send the prompt you want to execute on this session:</i>",
             parse_mode="HTML",
+            reply_markup=cancel_btn,
         )
 
     elif data.startswith("select_prompt_prof:"):
@@ -1257,10 +1278,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             sess = get_chat_session(chat_id)
             sess["conversation_id"] = None
             sess["profile"] = prof_name
+        context.user_data["pending_run"] = {
+            "profile": prof_name,
+            "conversation_id": None,
+            "pid": None,
+        }
+        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Prompt", callback_data="cancel_pending_run")]])
         await query.edit_message_text(
-            f"✨ Started fresh session on profile <b>{html.escape(prof_name)}</b>.\n"
-            f"Next message will create a new conversation under this profile.",
+            f"✨ <b>Fresh Session on {html.escape(prof_name)}!</b>\n\n"
+            f"💬 <i>Send the prompt you want to execute:</i>",
             parse_mode="HTML",
+            reply_markup=cancel_btn,
         )
 
     elif data == "do_quotas":
@@ -1444,12 +1472,14 @@ async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 cid=conv_id,
             )
             return
-        dispatch_label = f"Task dispatched to {profile} (Target PID: <code>{target_pid}</code>)..."
+        cid_short = f" (conv: <code>{conv_id[:8]}</code>)" if conv_id else ""
+        dispatch_label = f"Task dispatched to {profile}{cid_short}..."
     else:
         session = get_chat_session(chat_id)
         profile = session.get("profile")
         conv_id = session.get("conversation_id")
-        dispatch_label = f"Task dispatched to {profile}..."
+        cid_short = f" (conv: <code>{conv_id[:8]}</code>)" if conv_id else ""
+        dispatch_label = f"Task dispatched to {profile}{cid_short}..."
 
     # If no profile is selected, ask user to choose which profile to run with
     if not profile:
@@ -1638,6 +1668,10 @@ async def post_init(application) -> None:
     logger.info("Session monitor started in post_init.")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update: %s", context.error, exc_info=context.error)
+
+
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         print("ERROR: TELEGRAM_BOT_TOKEN is not configured in .env or environment!")
@@ -1659,6 +1693,7 @@ def main() -> None:
         .build()
     )
 
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("accounts", accounts_command))
