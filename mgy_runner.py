@@ -471,7 +471,14 @@ print("OK")
                     pass
 
             # Explicitly include known/imported conversations if not yet matched
-            known_ids = ["04a5d409-d7f6-4abd-9b40-ce321bc65d35", "bfdee43a-3ed6-4213-9bc1-860d2e9697d3"]
+            known_ids = [
+                "04a5d409-d7f6-4abd-9b40-ce321bc65d35",
+                "bfdee43a-3ed6-4213-9bc1-860d2e9697d3",
+                "5f538010-dd38-4342-bf38-19d71561e015",
+                "0d485f63-7787-4d82-bb0f-be50a1ed2984",
+                "93b594cc-b5c6-4d7f-9624-e7d4e341f338",
+                "2f805a2a-73ca-490f-a428-735f3b2b9ec3",
+            ]
             for kid in known_ids:
                 if kid not in seen_ids:
                     k_brain = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{kid}")
@@ -536,7 +543,7 @@ print("OK")
             "                            break\n"
             "        results.append({'id': cid, 'title': t or '(untitled)', 'step_count': d.get('step_count', 0), 'total_size_mb': round((dbs+bs)/(1024*1024), 1)})\n"
             "    except: pass\n"
-            "for kid in ['04a5d409-d7f6-4abd-9b40-ce321bc65d35', 'bfdee43a-3ed6-4213-9bc1-860d2e9697d3']:\n"
+            "for kid in ['04a5d409-d7f6-4abd-9b40-ce321bc65d35', 'bfdee43a-3ed6-4213-9bc1-860d2e9697d3', '5f538010-dd38-4342-bf38-19d71561e015', '0d485f63-7787-4d82-bb0f-be50a1ed2984', '93b594cc-b5c6-4d7f-9624-e7d4e341f338', '2f805a2a-73ca-490f-a428-735f3b2b9ec3']:\n"
             "    if kid not in seen:\n"
             "        kb = os.path.expanduser(f'~/.gemini/antigravity-cli/brain/{kid}')\n"
             "        kd = os.path.expanduser(f'~/.gemini/antigravity-cli/conversations/{kid}.db')\n"
