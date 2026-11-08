@@ -48,11 +48,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global instances
-runner = MgyRunner(mode=RUN_MODE, default_profile=MGY_PROFILE)
+# Global instances - no default profile or conversation configured
+runner = MgyRunner(mode=RUN_MODE, default_profile=None)
 monitor = SessionMonitor(runner=runner)
 
-# Active session tracking per chat (chat_id -> {"profile": str, "conversation_id": Optional[str]})
+# Active session tracking per chat (chat_id -> {"profile": Optional[str], "conversation_id": Optional[str]})
 chat_sessions: dict[int, dict] = {}
 # Known authorized chats to notify on external completion
 known_chats: Set[int] = set(ALLOWED_USER_IDS)
@@ -79,10 +79,41 @@ async def check_auth_or_reject(update: Update) -> bool:
 def get_chat_session(chat_id: int) -> dict:
     if chat_id not in chat_sessions:
         chat_sessions[chat_id] = {
-            "profile": runner.default_profile or "default",
+            "profile": None,
             "conversation_id": None,
         }
     return chat_sessions[chat_id]
+
+
+def is_gemini_filter_blocked(text: str) -> bool:
+    """Checks if output contains Gemini filter block notification."""
+    if not text:
+        return False
+    return bool(re.search(r"request was blocked by Gemini['’]?s filters", text, re.IGNORECASE))
+
+
+def format_filter_blocked_message(
+    cid: Optional[str],
+    title: Optional[str],
+    pid: Optional[int],
+    profile: Optional[str],
+    step_index: Optional[int],
+    is_running: bool,
+) -> tuple[str, str]:
+    """Formats filter block notification indicating whether session is still running or definitive return."""
+    pid_disp = f" (PID: <code>{pid}</code>)" if pid else ""
+    prof_disp = f" (<b>{html.escape(profile)}</b>)" if profile else ""
+    step_disp = f" [Step #{step_index}]" if step_index is not None else ""
+    cid_disp = f" for <code>{cid}</code>" if cid else ""
+
+    header = f"🚫 <b>Request blocked by Gemini's filters</b>{cid_disp}{pid_disp}{prof_disp}{step_disp}:"
+    if title:
+        header += f"\n<b>Session:</b> <i>{html.escape(title)}</i>"
+
+    status_icon = "⏳" if is_running else "🛑"
+    status_text = "Task is still running in background." if is_running else "Definitive return (process halted)."
+    body = f"🚫 <b>Request blocked.</b>\n{status_icon} <b>Status:</b> {status_text}"
+    return header, body
 
 
 async def send_chunked_code(
@@ -176,7 +207,47 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
     profile = conv_info.get("profile", "")
     step_index = conv_info.get("step_index")
 
-    if "Individual quota reached" in output_text or "RESOURCE_EXHAUSTED" in output_text or output_text.startswith("⚠️"):
+    if is_gemini_filter_blocked(output_text):
+        is_running = False
+        if pid:
+            is_running = await runner.is_pid_running(pid)
+        if not is_running and cid:
+            is_running = await runner.is_conversation_running(cid)
+
+        header, body = format_filter_blocked_message(
+            cid=cid,
+            title=title,
+            pid=pid,
+            profile=profile,
+            step_index=step_index,
+            is_running=is_running,
+        )
+
+        buttons = []
+        if pid:
+            buttons.append(InlineKeyboardButton("👁️ Peek", callback_data=f"peek:{pid}"))
+            if is_running:
+                buttons.append(InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_task:{pid}"))
+            else:
+                buttons.append(InlineKeyboardButton("🚀 Run", callback_data=f"run_inst:{pid}"))
+        buttons.append(InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}"))
+        markup = InlineKeyboardMarkup([buttons])
+
+        delivered_any = False
+        for cid_target in list(known_chats):
+            try:
+                await application.bot.send_message(
+                    chat_id=cid_target,
+                    text=f"{header}\n\n{body}",
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+                delivered_any = True
+            except Exception as e:
+                logger.warning("Failed to deliver filter block alert to chat %s: %s", cid_target, e)
+        return delivered_any
+
+    elif "Individual quota reached" in output_text or "RESOURCE_EXHAUSTED" in output_text or output_text.startswith("⚠️"):
         header = f"⚠️ <b>Quota Limit Reached!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{cid}</code>)"
         keyboard = [
             [
@@ -222,13 +293,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     session = get_chat_session(chat_id)
     cwd = runner.current_dir or "~"
     target_display = f"{SSH_USER}@{SSH_HOST}:{SSH_PORT}" if RUN_MODE == "ssh" else "Local Machine"
-    active_cid = session.get("conversation_id")
-    cid_str = active_cid[:8] if active_cid else "Latest / Active"
+    prof_str = session.get("profile") or "None (select via /new or /conversations)"
+    cid_str = active_cid[:8] if active_cid else "None"
 
     welcome_text = (
         f"⚡ <b>telegravity daemon ready</b>\n\n"
         f"<b>Target:</b> <code>{target_display}</code>\n"
-        f"<b>Profile:</b> <code>{session['profile']}</code>\n"
+        f"<b>Profile:</b> <code>{prof_str}</code>\n"
         f"<b>Session:</b> <code>{cid_str}</code>\n"
         f"<b>Remote CWD:</b> <code>{cwd}</code>\n\n"
         f"<b>Usage:</b>\n"
@@ -391,11 +462,15 @@ def format_peek_view(info: dict) -> tuple[str, InlineKeyboardMarkup]:
         header_lines.append(f"• <b>Session:</b> <code>{html.escape(conv_title or 'Active')}</code>{cid_disp}")
 
     header = "\n".join(header_lines)
-    body_label = "⏳ <b>Streaming output / Working:</b>" if is_running else "💬 <b>Recent Conversation Context:</b>"
-
-    display_text = content.strip() if content else "(No output captured yet)"
-    if len(display_text) > 3200:
-        display_text = "..." + display_text[-3000:]
+    if is_gemini_filter_blocked(content):
+        body_label = "🚫 <b>Gemini Filter Block:</b>"
+        st_desc = "Task is still running in background." if is_running else "Definitive return (process halted)."
+        display_text = f"Request was blocked by Gemini's filters.\nStatus: {st_desc}"
+    else:
+        body_label = "⏳ <b>Streaming output / Working:</b>" if is_running else "💬 <b>Recent Conversation Context:</b>"
+        display_text = content.strip() if content else "(No output captured yet)"
+        if len(display_text) > 3200:
+            display_text = "..." + display_text[-3000:]
 
     full_msg = f"{header}\n\n{body_label}\n<pre><code>{html.escape(display_text)}</code></pre>"
 
@@ -570,21 +645,37 @@ async def _wait_for_injected_response(
                     [
                         InlineKeyboardButton(f"🚀 Run {pid}", callback_data=f"run_inst:{pid}"),
                         InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
-                        InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
+                        InlineKeyboardButton(f"🛑 Cancel {pid}", callback_data=f"cancel_task:{pid}"),
                     ]
                 ]
                 markup = InlineKeyboardMarkup(reply_buttons)
                 turn_label = f" (Turn #{responses_delivered})" if responses_delivered > 1 else ""
-                header = f"💬 <b>Response from PID <code>{pid}</code> (<b>{html.escape(profile)}</b>){turn_label}:</b>"
 
-                await send_response_or_file(
-                    chat_id=chat_id,
-                    bot=context.bot,
-                    text=final_text,
-                    header=header,
-                    filename=f"response_{pid}.txt",
-                    reply_markup=markup,
-                )
+                if is_gemini_filter_blocked(final_text):
+                    f_hdr, f_body = format_filter_blocked_message(
+                        cid=cid,
+                        title="",
+                        pid=pid,
+                        profile=profile,
+                        step_index=curr_step if curr_step != -1 else None,
+                        is_running=is_running,
+                    )
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"{f_hdr}\n\n{f_body}",
+                        parse_mode="HTML",
+                        reply_markup=markup,
+                    )
+                else:
+                    header = f"💬 <b>Response from PID <code>{pid}</code> (<b>{html.escape(profile)}</b>){turn_label}:</b>"
+                    await send_response_or_file(
+                        chat_id=chat_id,
+                        bot=context.bot,
+                        text=final_text,
+                        header=header,
+                        filename=f"response_{pid}.txt",
+                        reply_markup=markup,
+                    )
             else:
                 logger.info("Response for %s (step %s) already delivered by SessionMonitor.", cid, curr_step)
 
@@ -844,15 +935,28 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         prof_names = ", ".join(f"<code>{p['name']}</code>" for p in profiles) if profiles else "None found"
         current = get_chat_session(chat_id)
         cid_display = current.get("conversation_id") or "None (starts new conversation)"
+        prof_disp = current.get("profile") or "None"
         text = (
             f"ℹ️ <b>Usage:</b> <code>/new &lt;profile&gt; [conversation_id]</code>\n\n"
             f"<b>Current Session:</b>\n"
-            f"• Profile: <code>{current['profile']}</code>\n"
+            f"• Profile: <code>{prof_disp}</code>\n"
             f"• Conversation: <code>{cid_display}</code>\n\n"
-            f"<b>Available Profiles:</b>\n{prof_names}"
+            f"<b>Select a profile to start a fresh session:</b>"
         )
+        buttons = []
+        row = []
+        for p in profiles:
+            p_name = p["name"]
+            row.append(InlineKeyboardButton(p_name, callback_data=f"bind_new_prof:{p_name}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_prof_select")])
+
         if update.message:
-            await update.message.reply_html(text)
+            await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     profile = args[0]
@@ -866,16 +970,18 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     conv_info = f" with conversation <code>{conv_id}</code>" if conv_id else " (new conversation)"
     if update.message:
         await update.message.reply_html(
-            f"✨ Session configured for profile <b>{profile}</b>{conv_info}.\n"
+            f"✨ Session configured for profile <b>{html.escape(profile)}</b>{conv_info}.\n"
             f"Next message will execute under this profile."
         )
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancels ongoing task execution, optionally targeting a specific PID."""
+    """Cancels ongoing task execution via SIGINT (Ctrl+C), optionally targeting a specific PID."""
     if not await check_auth_or_reject(update):
         return
 
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    sess = get_chat_session(chat_id) if chat_id else {}
     target_pid: Optional[int] = None
     if context.args:
         try:
@@ -883,10 +989,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except ValueError:
             pass
 
-    code, pid, msg = await runner.cancel_active_task(pid=target_pid)
+    code, pid, msg = await runner.cancel_active_task(pid=target_pid, conversation_id=sess.get("conversation_id"))
     pid_str = f" (PID: <code>{pid}</code>)" if pid else ""
     if code == 0 and pid:
-        reply_text = f"🛑 <b>Cancelled task{pid_str}</b>"
+        reply_text = f"🛑 <b>Cancelled task{pid_str}</b> (signal sent; process kept alive)"
     else:
         reply_text = f"🛑 <b>Cancel Request{pid_str}:</b> {html.escape(msg)}"
 
@@ -924,17 +1030,19 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     session = get_chat_session(chat_id)
     target_display = f"{SSH_USER}@{SSH_HOST}:{SSH_PORT}" if RUN_MODE == "ssh" else "Local Machine"
-    active_pid_str = f" (PID: <code>{runner.active_pid}</code>)" if runner.active_pid else ""
-    task_status = f"⚡ BUSY{active_pid_str} ({html.escape(runner.current_task or '')})" if runner.is_busy else "🟢 IDLE"
+    prof_str = session.get("profile") or "None (select via /new or /conversations)"
     active_cid = session.get("conversation_id")
-    cid_str = active_cid[:8] if active_cid else "Default / Latest"
+    cid_str = active_cid[:8] if active_cid else "None"
+    running_count = len(runner.active_tasks)
+    active_pid_str = f" (PID: <code>{runner.active_pid}</code>)" if runner.active_pid else ""
+    task_status = f"⚡ BUSY ({running_count} active){active_pid_str}" if running_count > 0 else "🟢 IDLE"
 
     code, sys_info, _ = await runner.run_raw("uptime && free -h 2>/dev/null || uname -a", timeout=10)
 
     text = (
         f"📊 <b>System & Daemon Status:</b>\n\n"
         f"• <b>Target:</b> <code>{target_display}</code>\n"
-        f"• <b>Profile:</b> <code>{session['profile']}</code>\n"
+        f"• <b>Profile:</b> <code>{prof_str}</code>\n"
         f"• <b>Active Conversation:</b> <code>{cid_str}</code>\n"
         f"• <b>Remote CWD:</b> <code>{runner.current_dir or '~'}</code>\n"
         f"• <b>Task State:</b> {task_status}\n\n"
@@ -1042,25 +1150,116 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data or ""
     chat_id = query.message.chat_id if query.message else None
 
-    if data.startswith("resume:"):
+    if data.startswith("resume:") or data.startswith("choose_profile_for_conv:"):
         cid = data.split(":", 1)[1]
+        profiles = await runner.list_profiles()
+        if not profiles:
+            if chat_id:
+                sess = get_chat_session(chat_id)
+                sess["conversation_id"] = cid
+            await query.edit_message_text(
+                f"🔄 Pinned active conversation to <code>{cid}</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        buttons = []
+        row = []
+        for p in profiles:
+            p_name = p["name"]
+            row.append(InlineKeyboardButton(p_name, callback_data=f"bind_conv_prof:{cid}:{p_name}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_prof_select")])
+
+        await query.edit_message_text(
+            f"👤 <b>Select a profile to run conversation <code>{cid[:8]}</code>:</b>\n\n"
+            f"<i>Choose which mgy profile / account to bind to this conversation:</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("bind_conv_prof:"):
+        parts = data.split(":", 2)
+        cid = parts[1]
+        prof_name = parts[2]
         if chat_id:
             sess = get_chat_session(chat_id)
             sess["conversation_id"] = cid
+            sess["profile"] = prof_name
         await query.edit_message_text(
-            f"🔄 Pinned active conversation to <code>{cid}</code>.\nNext prompt will resume this conversation.",
+            f"✅ <b>Bound conversation <code>{cid[:8]}</code> to profile <b>{html.escape(prof_name)}</b>.</b>\n\n"
+            f"Next message you send will be dispatched with this profile and conversation.",
             parse_mode="HTML",
         )
 
+    elif data.startswith("select_prompt_prof:"):
+        prof_name = data.split(":", 1)[1]
+        if chat_id:
+            sess = get_chat_session(chat_id)
+            sess["profile"] = prof_name
+        pending_prompt = context.user_data.pop("pending_prompt", None)
+        if pending_prompt and chat_id:
+            conv_id = sess.get("conversation_id")
+            preview_prompt = pending_prompt[:100] + ("..." if len(pending_prompt) > 100 else "")
+            cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_task")]])
+            status_msg = await query.message.reply_html(
+                f"🚀 <b>Task dispatched to {html.escape(prof_name)}...</b>\n"
+                f"<i>Prompt:</i> <code>{html.escape(preview_prompt)}</code>\n\n"
+                f"⏳ Processing in background...",
+                reply_markup=cancel_btn,
+            )
+            asyncio.create_task(
+                _execute_and_reply(
+                    prompt=pending_prompt,
+                    profile=prof_name,
+                    conv_id=conv_id,
+                    continue_session=(conv_id is None),
+                    status_msg=status_msg,
+                    preview_prompt=preview_prompt,
+                    chat_id=chat_id,
+                    context=context,
+                )
+            )
+            await query.edit_message_text(f"✅ Active profile set to <b>{html.escape(prof_name)}</b> and prompt dispatched!", parse_mode="HTML")
+        else:
+            await query.edit_message_text(f"✅ Active profile set to <b>{html.escape(prof_name)}</b>.", parse_mode="HTML")
+
+    elif data == "cancel_prof_select":
+        context.user_data.pop("pending_prompt", None)
+        await query.edit_message_text("❌ Selection cancelled.")
+
     elif data == "new_session":
+        profiles = await runner.list_profiles()
+        buttons = []
+        row = []
+        for p in profiles:
+            p_name = p["name"]
+            row.append(InlineKeyboardButton(p_name, callback_data=f"bind_new_prof:{p_name}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_prof_select")])
+        await query.edit_message_text(
+            "👤 <b>Select a profile for the new session:</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("bind_new_prof:"):
+        prof_name = data.split(":", 1)[1]
         if chat_id:
             sess = get_chat_session(chat_id)
             sess["conversation_id"] = None
-            prof = sess["profile"]
-        else:
-            prof = runner.default_profile or "default"
+            sess["profile"] = prof_name
         await query.edit_message_text(
-            f"✨ Started fresh session on profile <b>{prof}</b>.",
+            f"✨ Started fresh session on profile <b>{html.escape(prof_name)}</b>.\n"
+            f"Next message will create a new conversation under this profile.",
             parse_mode="HTML",
         )
 
@@ -1085,15 +1284,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "do_status":
         session = get_chat_session(chat_id)
         target_display = f"{SSH_USER}@{SSH_HOST}:{SSH_PORT}" if RUN_MODE == "ssh" else "Local Machine"
-        active_pid_str = f" (PID: <code>{runner.active_pid}</code>)" if runner.active_pid else ""
-        task_status = f"⚡ BUSY{active_pid_str} ({html.escape(runner.current_task or '')})" if runner.is_busy else "🟢 IDLE"
+        prof_str = session.get("profile") or "None (select via /new or /conversations)"
         active_cid = session.get("conversation_id")
-        cid_str = active_cid[:8] if active_cid else "Default / Latest"
+        cid_str = active_cid[:8] if active_cid else "None"
+        running_count = len(runner.active_tasks)
+        active_pid_str = f" (PID: <code>{runner.active_pid}</code>)" if runner.active_pid else ""
+        task_status = f"⚡ BUSY ({running_count} active){active_pid_str}" if running_count > 0 else "🟢 IDLE"
         code, sys_info, _ = await runner.run_raw("uptime && free -h 2>/dev/null || uname -a", timeout=10)
         text = (
             f"📊 <b>System & Daemon Status:</b>\n\n"
             f"• <b>Target:</b> <code>{target_display}</code>\n"
-            f"• <b>Profile:</b> <code>{session['profile']}</code>\n"
+            f"• <b>Profile:</b> <code>{prof_str}</code>\n"
             f"• <b>Active Conversation:</b> <code>{cid_str}</code>\n"
             f"• <b>Remote CWD:</b> <code>{runner.current_dir or '~'}</code>\n"
             f"• <b>Task State:</b> {task_status}\n\n"
@@ -1246,20 +1447,46 @@ async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         dispatch_label = f"Task dispatched to {profile} (Target PID: <code>{target_pid}</code>)..."
     else:
         session = get_chat_session(chat_id)
-        profile = session["profile"]
+        profile = session.get("profile")
         conv_id = session.get("conversation_id")
         dispatch_label = f"Task dispatched to {profile}..."
 
-    if runner.is_busy:
+    # If no profile is selected, ask user to choose which profile to run with
+    if not profile:
+        context.user_data["pending_prompt"] = prompt
+        profiles = await runner.list_profiles()
+        buttons = []
+        row = []
+        for p in profiles:
+            p_name = p["name"]
+            row.append(InlineKeyboardButton(p_name, callback_data=f"select_prompt_prof:{p_name}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_prof_select")])
         if update.message:
-            pid = runner.active_pid
-            btn_label = f"🛑 Cancel Running Task (PID: {pid})" if pid else "🛑 Cancel Running Task"
-            cb_data = f"cancel_task:{pid}" if pid else "cancel_task"
-            cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton(btn_label, callback_data=cb_data)]])
-            pid_info = f" (PID: <code>{pid}</code>)" if pid else ""
             await update.message.reply_html(
-                f"⏳ Runner is currently busy with{pid_info}: <code>{html.escape(runner.current_task or '')}</code>\n"
-                f"Please wait for it to complete or cancel it.",
+                "👤 <b>No profile selected.</b>\n"
+                "Please select an account / profile to run this prompt with:",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        return
+
+    # Check if this specific conversation is already actively running
+    if conv_id and await runner.is_conversation_running(conv_id):
+        instances = await runner.get_instances()
+        target = next((i for i in instances if i.get("conversation_id") == conv_id and i.get("is_running")), None)
+        c_pid = target.get("pid") if target else None
+        btn_label = f"🛑 Cancel Task (PID: {c_pid})" if c_pid else "🛑 Cancel Task"
+        cb_data = f"cancel_task:{c_pid}" if c_pid else "cancel_task"
+        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton(btn_label, callback_data=cb_data)]])
+        pid_info = f" (PID: <code>{c_pid}</code>)" if c_pid else ""
+        if update.message:
+            await update.message.reply_html(
+                f"⏳ Conversation <code>{conv_id[:8]}</code> is already executing a task{pid_info}.\n"
+                f"Please wait for it to complete or cancel it before sending another prompt to this conversation.",
                 reply_markup=cancel_btn,
             )
         return
@@ -1337,17 +1564,38 @@ async def _execute_and_reply(
         if not output:
             output = "(Task completed with empty output)"
 
-        if "Individual quota reached" in output or "RESOURCE_EXHAUSTED" in output:
+        if is_gemini_filter_blocked(output):
+            header, body_text = format_filter_blocked_message(
+                cid=conv_id,
+                title="",
+                pid=None,
+                profile=profile,
+                step_index=None,
+                is_running=False,
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{header}\n\n{body_text}",
+                parse_mode="HTML",
+            )
+        elif "Individual quota reached" in output or "RESOURCE_EXHAUSTED" in output:
             header = f"⚠️ <b>Quota Limit Reached (profile: {profile})</b>:"
+            await send_response_or_file(
+                chat_id=chat_id,
+                bot=context.bot,
+                text=output,
+                header=header,
+                filename=f"response_{profile}.txt",
+            )
         else:
             header = f"✅ <b>Task Completed (profile: {profile})</b>:"
-        await send_response_or_file(
-            chat_id=chat_id,
-            bot=context.bot,
-            text=output,
-            header=header,
-            filename=f"response_{profile}.txt",
-        )
+            await send_response_or_file(
+                chat_id=chat_id,
+                bot=context.bot,
+                text=output,
+                header=header,
+                filename=f"response_{profile}.txt",
+            )
 
     except Exception as e:
         logger.error("Error executing task: %s", e)

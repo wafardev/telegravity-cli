@@ -48,23 +48,77 @@ class MgyRunner:
         ) if mode == "ssh" else None
         if self.ssh_runner and self.current_dir:
             self.ssh_runner.current_dir = self.current_dir
-        self._active_proc: Optional[asyncio.subprocess.Process] = None
-        self._active_pid: Optional[int] = None
+        self._active_tasks: Dict[str, Dict[str, Any]] = {}
         self._live_stream: Dict[int, List[str]] = {}
-        self._is_busy: bool = False
-        self._current_task_description: Optional[str] = None
 
     @property
     def is_busy(self) -> bool:
-        return self._is_busy
+        return bool(self._active_tasks)
+
+    @property
+    def active_tasks(self) -> Dict[str, Dict[str, Any]]:
+        return self._active_tasks
 
     @property
     def active_pid(self) -> Optional[int]:
-        return self._active_pid
+        for t in reversed(list(self._active_tasks.values())):
+            if t.get("pid"):
+                return t["pid"]
+        return None
 
     @property
     def current_task(self) -> Optional[str]:
-        return self._current_task_description
+        for t in reversed(list(self._active_tasks.values())):
+            if t.get("description"):
+                return t["description"]
+        return None
+
+    def is_conversation_busy(self, conversation_id: Optional[str]) -> bool:
+        """Returns True if the specific conversation is currently executing in _active_tasks."""
+        if not conversation_id:
+            return False
+        for t in self._active_tasks.values():
+            if t.get("conversation_id") == conversation_id:
+                return True
+        return False
+
+    async def is_conversation_running(self, conversation_id: Optional[str]) -> bool:
+        """Returns True if conversation is active in _active_tasks or in OS process list."""
+        if not conversation_id:
+            return False
+        if self.is_conversation_busy(conversation_id):
+            return True
+        try:
+            instances = await self.get_instances()
+            for inst in instances:
+                if inst.get("conversation_id") == conversation_id and inst.get("is_running"):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    async def is_pid_running(self, pid: int) -> bool:
+        """Checks if a process PID is alive and not a zombie."""
+        if pid <= 0:
+            return False
+        if self.mode == "local":
+            try:
+                os.kill(pid, 0)
+                stat_file = f"/proc/{pid}/stat"
+                if os.path.exists(stat_file):
+                    try:
+                        with open(stat_file, "r") as f:
+                            fields = f.read().split()
+                            if len(fields) > 2 and fields[2] == "Z":
+                                return False
+                    except Exception:
+                        pass
+                return True
+            except OSError:
+                return False
+        else:
+            code, _, _ = await self.run_raw(f"kill -0 {pid} 2>/dev/null", timeout=5)
+            return code == 0
 
     @property
     def mgy_bin(self) -> str:
@@ -87,6 +141,7 @@ class MgyRunner:
         else:
             # Local execution
             cwd = os.path.expanduser(self.current_dir) if self.current_dir else None
+            proc = None
             try:
                 proc = await asyncio.create_subprocess_shell(
                     cmd,
@@ -94,21 +149,18 @@ class MgyRunner:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=cwd,
                 )
-                self._active_proc = proc
                 stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=t)
                 code = proc.returncode if proc.returncode is not None else 1
                 return code, stdout_b.decode("utf-8", errors="replace"), stderr_b.decode("utf-8", errors="replace")
             except asyncio.TimeoutError:
-                if self._active_proc:
+                if proc:
                     try:
-                        self._active_proc.kill()
+                        proc.kill()
                     except ProcessLookupError:
                         pass
                 return 124, "", f"Error: Command timed out after {t}s"
             except Exception as e:
                 return 1, "", f"Execution error: {str(e)}"
-            finally:
-                self._active_proc = None
 
     async def get_mgy_list(self) -> str:
         """Returns the raw output of 'mgy list' from the device."""
@@ -255,32 +307,35 @@ print(json.dumps(active))
             is_running = False
 
             # Check 1: runner is currently busy with this PID or its descendants/ancestors
-            if self._is_busy and self._active_pid:
-                active_str = str(self._active_pid)
+            active_pids = [str(t.get("pid")) for t in self._active_tasks.values() if t.get("pid")]
+            for active_str in active_pids:
                 if active_str == inst_pid:
                     is_running = True
-                else:
-                    stack = [active_str]
-                    while stack:
-                        p = stack.pop()
-                        for c_pid, _ in children_map.get(p, []):
-                            if c_pid == inst_pid:
-                                is_running = True
-                                break
-                            stack.append(c_pid)
-                        if is_running:
+                    break
+                stack = [active_str]
+                while stack:
+                    p = stack.pop()
+                    for c_pid, _ in children_map.get(p, []):
+                        if c_pid == inst_pid:
+                            is_running = True
                             break
-                    if not is_running:
-                        stack = [inst_pid]
-                        while stack:
-                            p = stack.pop()
-                            for c_pid, _ in children_map.get(p, []):
-                                if c_pid == active_str:
-                                    is_running = True
-                                    break
-                                stack.append(c_pid)
-                            if is_running:
-                                break
+                        stack.append(c_pid)
+                    if is_running:
+                        break
+                if is_running:
+                    break
+                stack = [inst_pid]
+                while stack:
+                    p = stack.pop()
+                    for c_pid, _ in children_map.get(p, []):
+                        if c_pid == active_str:
+                            is_running = True
+                            break
+                        stack.append(c_pid)
+                    if is_running:
+                        break
+                if is_running:
+                    break
 
             # Check 2: specific conversation is marked not_fully_idle
             if not is_running and conv_id and conv_id in active_conv_ids:
@@ -736,13 +791,23 @@ sys.exit(res.returncode)
     ) -> Tuple[int, str, str]:
         """
         Dispatches an agy task via mgy using the specified profile.
+        Allows concurrent execution across different conversations and profiles.
         Returns: (returncode, stdout, stderr)
         """
-        if self._is_busy:
-            return 1, "", "Runner is busy with another task. Use /cancel first."
+        if conversation_id and self.is_conversation_busy(conversation_id):
+            return 1, "", f"Conversation {conversation_id[:8]} is already running a task. Use /cancel first."
 
-        self._is_busy = True
-        self._current_task_description = prompt[:80] + ("..." if len(prompt) > 80 else "")
+        task_id = f"{profile}_{conversation_id or 'fresh'}_{int(time.time() * 1000)}"
+        task_info: Dict[str, Any] = {
+            "task_id": task_id,
+            "profile": profile,
+            "conversation_id": conversation_id,
+            "description": prompt[:80] + ("..." if len(prompt) > 80 else ""),
+            "started_at": time.time(),
+            "pid": None,
+            "proc": None,
+        }
+        self._active_tasks[task_id] = task_info
 
         try:
             # Escape prompt safely for shell
@@ -771,8 +836,8 @@ sys.exit(res.returncode)
                         stderr=asyncio.subprocess.PIPE,
                         cwd=cwd,
                     )
-                    self._active_proc = proc
-                    self._active_pid = proc.pid
+                    task_info["proc"] = proc
+                    task_info["pid"] = proc.pid
                     self._live_stream[proc.pid] = []
 
                     if on_start and proc.pid:
@@ -804,86 +869,90 @@ sys.exit(res.returncode)
                     code = proc.returncode if proc.returncode is not None else 1
                     return code, "".join(stdout_parts), "".join(stderr_parts)
                 except asyncio.TimeoutError:
-                    if self._active_proc:
+                    if task_info.get("proc"):
                         try:
-                            self._active_proc.kill()
+                            task_info["proc"].kill()
                         except ProcessLookupError:
                             pass
                     return 124, "", f"Error: Command timed out after {TASK_TIMEOUT}s"
                 except Exception as e:
                     return 1, "", f"Execution error: {str(e)}"
-                finally:
-                    self._active_proc = None
-                    self._active_pid = None
             else:
                 # SSH mode
                 code, out, err = await self.run_raw(full_cmd, timeout=TASK_TIMEOUT)
                 return code, out, err
         finally:
-            self._is_busy = False
-            self._current_task_description = None
-            self._active_pid = None
+            self._active_tasks.pop(task_id, None)
 
-    async def cancel_active_task(self, pid: Optional[int] = None) -> Tuple[int, Optional[int], str]:
+    async def cancel_active_task(
+        self,
+        pid: Optional[int] = None,
+        conversation_id: Optional[str] = None,
+    ) -> Tuple[int, Optional[int], str]:
         """
-        Cancels any running mgy / agy turn.
+        Cancels any running mgy / agy turn without killing the process.
+        Sends SIGINT (Ctrl+C) to interrupt the prompt/turn cleanly so another task can open.
         Returns: (returncode, pid, status_message)
         """
-        target_pid = pid or self._active_pid
+        target_pid = pid
+        target_task_id = None
+
+        if not target_pid and conversation_id:
+            for tid, tinfo in list(self._active_tasks.items()):
+                if tinfo.get("conversation_id") == conversation_id:
+                    target_pid = tinfo.get("pid")
+                    target_task_id = tid
+                    break
+
+        if not target_pid and self._active_tasks:
+            # Pick most recent task in _active_tasks
+            last_tid = list(self._active_tasks.keys())[-1]
+            target_pid = self._active_tasks[last_tid].get("pid")
+            target_task_id = last_tid
 
         if not target_pid:
-            # Look up active mgy instance in process table
+            # Look up running mgy/agy instance in process table
             instances = await self.get_instances()
             for inst in instances:
-                if inst.get("type") == "mgy":
+                if inst.get("is_running"):
                     try:
                         target_pid = int(inst["pid"])
                         break
-                    except ValueError:
+                    except (ValueError, TypeError):
                         pass
 
         if target_pid:
-            has_tty = await self.has_interactive_tty(target_pid)
-            if has_tty:
-                # For interactive terminal sessions, send SIGINT (Ctrl+C) to cancel current turn without killing shell
-                await self.run_raw(f"kill -2 {target_pid} 2>/dev/null", timeout=5)
-                code_c, out_c, _ = await self.run_raw(f"pgrep -P {target_pid} 2>/dev/null", timeout=5)
-                if code_c == 0 and out_c.strip():
-                    for c_pid in out_c.strip().split():
-                        await self.run_raw(f"kill -2 {c_pid} 2>/dev/null", timeout=5)
-                self._is_busy = False
-                self._current_task_description = None
-                self._active_pid = None
-                return 0, target_pid, f"Sent cancel signal (Ctrl+C) to PID {target_pid}"
-            else:
-                success, msg = await self.kill_process(target_pid)
-                self._is_busy = False
-                self._current_task_description = None
-                self._active_pid = None
-                if self._active_proc:
-                    try:
-                        self._active_proc.kill()
-                    except ProcessLookupError:
-                        pass
-                    self._active_proc = None
-                return (0 if success else 1), target_pid, f"Cancelled task (PID: {target_pid})"
+            # Collect all descendant PIDs recursively (e.g. tools, agy under mgy)
+            all_to_interrupt = [target_pid]
+            stack = [target_pid]
+            while stack:
+                curr = stack.pop()
+                c_code, c_out, _ = await self.run_raw(f"pgrep -P {curr} 2>/dev/null", timeout=5)
+                if c_code == 0 and c_out.strip():
+                    for cp in c_out.strip().split():
+                        if cp.isdigit() and int(cp) not in all_to_interrupt:
+                            c_val = int(cp)
+                            all_to_interrupt.append(c_val)
+                            stack.append(c_val)
 
-        if self._active_proc:
-            proc_pid = self._active_proc.pid
-            try:
-                self._active_proc.kill()
-            except ProcessLookupError:
-                pass
-            self._is_busy = False
-            self._current_task_description = None
-            self._active_proc = None
-            self._active_pid = None
-            return 0, proc_pid, f"Cancelled task (PID: {proc_pid})"
+            # Send SIGINT (Ctrl+C) to children in reverse order (bottom-up), then root
+            for p in reversed(all_to_interrupt):
+                await self.run_raw(f"kill -2 {p} 2>/dev/null", timeout=5)
 
-        self._is_busy = False
-        self._current_task_description = None
-        self._active_pid = None
-        return 0, None, "No active running task found."
+            # Signal asyncio proc if tracked
+            for tid, tinfo in list(self._active_tasks.items()):
+                if tinfo.get("pid") == target_pid or (target_task_id and tid == target_task_id):
+                    proc = tinfo.get("proc")
+                    if proc and proc.returncode is None:
+                        try:
+                            proc.send_signal(signal.SIGINT)
+                        except ProcessLookupError:
+                            pass
+                    self._active_tasks.pop(tid, None)
+
+            return 0, target_pid, f"Sent cancel signal (Ctrl+C) to PID {target_pid}"
+
+        return 0, None, "No active running task found to cancel."
 
     @staticmethod
     def _extract_last_sentences(text: str, max_sentences: int = 4, max_chars: int = 1200) -> str:
@@ -1120,7 +1189,7 @@ sys.exit(res.returncode)
         # Check running state
         instances = await self.get_instances()
         target_inst = next((i for i in instances if str(i.get("pid")) == str(pid)), None)
-        is_running = target_inst.get("is_running", False) if target_inst else (self._is_busy and self._active_pid == pid)
+        is_running = target_inst.get("is_running", False) if target_inst else any(t.get("pid") == pid for t in self._active_tasks.values())
 
         # Check live stream buffer if task was dispatched via telegravity
         live_lines = self._live_stream.get(pid, [])
