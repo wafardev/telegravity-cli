@@ -30,6 +30,7 @@ SSH_HOST = os.getenv("SSH_HOST", "").strip()
 SSH_PORT = int(os.getenv("SSH_PORT", "22").strip())
 SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", "").strip() or None
 SSH_TIMEOUT = int(os.getenv("SSH_TIMEOUT", "600").strip())
+TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT", "86400").strip())
 
 # Session monitor poll interval in seconds
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "3").strip())

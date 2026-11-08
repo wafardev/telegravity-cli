@@ -16,6 +16,7 @@ from config import (
     SSH_PORT,
     SSH_KEY_PATH,
     SSH_TIMEOUT,
+    TASK_TIMEOUT,
 )
 from ssh_runner import SSHRunner
 
@@ -152,6 +153,10 @@ class MgyRunner:
             if "telegravity" in args or "grep" in args:
                 continue
 
+            # Skip shell wrappers (e.g., /bin/sh -c "mgy ...", bash -c "mgy ...")
+            if re.search(r"(?:^|[\s/])(?:ba)?sh\s+-c\s+", args):
+                continue
+
             match = re.search(r"(?:^|[\s/])mgy(?:\.sh|\.py)?(?:\s+(.*))?$", args)
             if match:
                 mgy_args = (match.group(1) or "").strip()
@@ -164,6 +169,11 @@ class MgyRunner:
                     "args": mgy_args,
                 })
                 mgy_pids.add(pid)
+
+        # Drop any instance whose child is also an instance in mgy_pids (e.g. nested wrapper scripts)
+        child_pids_set = {inst["pid"] for inst in instances}
+        instances = [inst for inst in instances if inst["pid"] not in {i["ppid"] for i in instances if i["ppid"] in child_pids_set}]
+        mgy_pids = {inst["pid"] for inst in instances}
 
         # Second pass: find standalone agy processes whose parent is not mgy
         for pid, ppid, args in raw_procs:
@@ -228,21 +238,33 @@ print(json.dumps([dict(r) for r in rows]))
 
             is_running = False
 
-            # Check 1: runner is currently busy with this PID or its descendants
+            # Check 1: runner is currently busy with this PID or its descendants/ancestors
             if self._is_busy and self._active_pid:
-                if str(self._active_pid) == inst_pid:
+                active_str = str(self._active_pid)
+                if active_str == inst_pid:
                     is_running = True
                 else:
-                    stack = [inst_pid]
+                    stack = [active_str]
                     while stack:
                         p = stack.pop()
                         for c_pid, _ in children_map.get(p, []):
-                            if c_pid == str(self._active_pid):
+                            if c_pid == inst_pid:
                                 is_running = True
                                 break
                             stack.append(c_pid)
                         if is_running:
                             break
+                    if not is_running:
+                        stack = [inst_pid]
+                        while stack:
+                            p = stack.pop()
+                            for c_pid, _ in children_map.get(p, []):
+                                if c_pid == active_str:
+                                    is_running = True
+                                    break
+                                stack.append(c_pid)
+                            if is_running:
+                                break
 
             # Check 2: specific conversation is marked not_fully_idle
             if not is_running and conv_id and conv_id in active_conv_ids:
@@ -734,7 +756,7 @@ sys.exit(res.returncode)
                     t_out = asyncio.create_task(_stream_pipe(proc.stdout, proc.pid, stdout_parts))
                     t_err = asyncio.create_task(_stream_pipe(proc.stderr, proc.pid, stderr_parts))
 
-                    await asyncio.wait_for(asyncio.gather(t_out, t_err, proc.wait()), timeout=SSH_TIMEOUT)
+                    await asyncio.wait_for(asyncio.gather(t_out, t_err, proc.wait()), timeout=TASK_TIMEOUT)
                     code = proc.returncode if proc.returncode is not None else 1
                     return code, "".join(stdout_parts), "".join(stderr_parts)
                 except asyncio.TimeoutError:
@@ -743,7 +765,7 @@ sys.exit(res.returncode)
                             self._active_proc.kill()
                         except ProcessLookupError:
                             pass
-                    return 124, "", f"Error: Command timed out after {SSH_TIMEOUT}s"
+                    return 124, "", f"Error: Command timed out after {TASK_TIMEOUT}s"
                 except Exception as e:
                     return 1, "", f"Execution error: {str(e)}"
                 finally:
@@ -751,7 +773,7 @@ sys.exit(res.returncode)
                     self._active_pid = None
             else:
                 # SSH mode
-                code, out, err = await self.run_raw(full_cmd, timeout=SSH_TIMEOUT)
+                code, out, err = await self.run_raw(full_cmd, timeout=TASK_TIMEOUT)
                 return code, out, err
         finally:
             self._is_busy = False
@@ -875,6 +897,7 @@ sys.exit(res.returncode)
         cand_dbs = [os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")] + glob.glob(os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/conversation_summaries.db"))
         for db in cand_dbs:
             if os.path.exists(db):
+                conn = None
                 try:
                     import sqlite3
                     conn = sqlite3.connect(db)
@@ -891,6 +914,12 @@ sys.exit(res.returncode)
                             break
                 except Exception:
                     pass
+                finally:
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
 
         # Extract rich dialogue context from transcript
         content = ""
@@ -1097,6 +1126,7 @@ if not found_cid:
             break
 db = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
 if os.path.exists(db):
+    conn = None
     try:
         conn = sqlite3.connect(db)
         if found_cid:
@@ -1110,6 +1140,12 @@ if os.path.exists(db):
                 found_title = r[1]
     except Exception:
         pass
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 content = ""
 status = "unknown"
 latest_step = -1

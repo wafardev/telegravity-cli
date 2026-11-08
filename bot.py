@@ -672,6 +672,24 @@ async def _dispatch_to_pid_or_spawn(
             else:
                 await context.bot.send_message(chat_id=chat_id, text=err_text, parse_mode="HTML")
     else:
+        # Check if the target PID is already actively running or has an ongoing prompt
+        instances = await runner.get_instances()
+        target_inst = next((i for i in instances if str(i.get("pid")) == str(pid)), None)
+        is_target_running = target_inst.get("is_running", False) if target_inst else False
+
+        if is_target_running or (cid and any(i.get("conversation_id") == cid and i.get("is_running") for i in instances)):
+            warn_text = (
+                f"⚠️ <b>PID <code>{pid}</code> ({profile}) is already actively executing a task.</b>\n\n"
+                f"<i>Cannot inject prompts into a headless running instance, and running another task on this session concurrently would corrupt the conversation.</i>\n\n"
+                f"Use /peek <code>{pid}</code> to follow progress or /cancel to stop it."
+            )
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}")]])
+            if update.message:
+                await update.message.reply_html(warn_text, reply_markup=markup)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=warn_text, parse_mode="HTML", reply_markup=markup)
+            return
+
         # Fallback for non-interactive / headless PID: dispatch background task
         cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton(f"🛑 Cancel Task (PID: {pid})", callback_data=f"cancel_task:{pid}")]])
         msg_obj = update.message if update.message else None

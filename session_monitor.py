@@ -31,6 +31,7 @@ def _poll_scan_sync(handled_map: Dict[str, List[int]], handled_quotas: List[str]
     conv_map: Dict[str, Dict[str, Any]] = {}
     for db in dbs:
         if os.path.exists(db):
+            conn = None
             try:
                 conn = sqlite3.connect(db)
                 conn.row_factory = sqlite3.Row
@@ -43,6 +44,12 @@ def _poll_scan_sync(handled_map: Dict[str, List[int]], handled_quotas: List[str]
                         conv_map[cid] = dict(r)
             except Exception:
                 pass
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
     # 2. Discover running instances from /proc to get active PIDs and profiles
     running_pids: Dict[str, Dict[str, Any]] = {}
@@ -228,6 +235,7 @@ def _poll_scan_sync(handled_map, handled_quotas, last_mtimes=None):
     conv_map = {}
     for db in dbs:
         if os.path.exists(db):
+            conn = None
             try:
                 conn = sqlite3.connect(db)
                 conn.row_factory = sqlite3.Row
@@ -240,6 +248,12 @@ def _poll_scan_sync(handled_map, handled_quotas, last_mtimes=None):
                         conv_map[cid] = dict(r)
             except Exception:
                 pass
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
     running_pids = {}
     if os.path.exists("/proc"):
@@ -455,6 +469,7 @@ class SessionMonitor:
         all_rows = []
         for db in dbs:
             if os.path.exists(db):
+                conn = None
                 try:
                     conn = sqlite3.connect(db)
                     conn.row_factory = sqlite3.Row
@@ -464,6 +479,12 @@ class SessionMonitor:
                     all_rows.extend([dict(r) for r in rows])
                 except Exception:
                     pass
+                finally:
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
         all_rows.sort(key=lambda r: r.get("last_mod") or "", reverse=True)
         return all_rows[:limit]
 
