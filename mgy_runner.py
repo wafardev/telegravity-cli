@@ -197,17 +197,33 @@ class MgyRunner:
         if not instances:
             return []
 
-        # Query active conversations in SQLite database
+        # Query active conversations across all databases (default and all multigravity profiles)
         active_conv_query = """
-import sqlite3, json, os
-db = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
-if not os.path.exists(db):
-    print("[]")
-    exit(0)
-conn = sqlite3.connect(db)
-conn.row_factory = sqlite3.Row
-rows = conn.execute("SELECT conversation_id, title, not_fully_idle FROM conversation_summaries WHERE not_fully_idle = 1").fetchall()
-print(json.dumps([dict(r) for r in rows]))
+import sqlite3, json, os, glob
+dbs = [os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")] + glob.glob(
+    os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/conversation_summaries.db")
+)
+active = []
+seen = set()
+for db in dbs:
+    if os.path.exists(db):
+        conn = None
+        try:
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT conversation_id, title, status, not_fully_idle FROM conversation_summaries WHERE not_fully_idle = 1").fetchall()
+            for r in rows:
+                cid = r["conversation_id"]
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    active.append(dict(r))
+        except Exception:
+            pass
+        finally:
+            if conn:
+                try: conn.close()
+                except Exception: pass
+print(json.dumps(active))
 """
         code2, out2, _ = await self.run_raw(f"python3 -c '{active_conv_query.strip()}'", timeout=5)
         active_convs = []
@@ -275,19 +291,40 @@ print(json.dumps([dict(r) for r in rows]))
                 is_running = True
 
             # Check 4: instance has active tool child processes running under agy
-            if not is_running:
-                stack = [inst_pid]
-                while stack:
-                    p = stack.pop()
-                    for c_pid, c_args in children_map.get(p, []):
-                        if not re.search(r"(?:^|[\s/])(mgy|agy)(?:\s|$)", c_args):
-                            is_running = True
-                            break
-                        stack.append(c_pid)
-                    if is_running:
+            has_tool_child = False
+            stack = [inst_pid]
+            while stack:
+                p = stack.pop()
+                for c_pid, c_args in children_map.get(p, []):
+                    if not re.search(r"(?:^|[\s/])(mgy|agy)(?:\s|$)", c_args):
+                        has_tool_child = True
                         break
+                    stack.append(c_pid)
+                if has_tool_child:
+                    break
+
+            if not is_running and has_tool_child:
+                is_running = True
+
+            # Check 5: if process was started with -p (non-interactive batch / goal mode),
+            # it is executing a prompt for its entire lifetime until it exits.
+            if not is_running and re.search(r"(?:^|\s)-p(?:\s|=)", args_str):
+                is_running = True
 
             inst["is_running"] = is_running
+
+            # Determine human-friendly status detail
+            if is_running:
+                if has_tool_child:
+                    inst["status_detail"] = "executing tools"
+                elif "/goal" in args_str:
+                    inst["status_detail"] = "in a goal / autonomous loop"
+                elif conv_id and conv_id in active_conv_ids:
+                    inst["status_detail"] = "awaiting background task"
+                else:
+                    inst["status_detail"] = "in a prompt"
+            else:
+                inst["status_detail"] = None
 
             # If not running, check if it stopped due to depleted quota
             is_quota_depleted = False
@@ -895,6 +932,8 @@ sys.exit(res.returncode)
 
         # Fallback to latest conversation in database
         cand_dbs = [os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")] + glob.glob(os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/conversation_summaries.db"))
+        found_idle = False
+        found_status = ""
         for db in cand_dbs:
             if os.path.exists(db):
                 conn = None
@@ -902,15 +941,19 @@ sys.exit(res.returncode)
                     import sqlite3
                     conn = sqlite3.connect(db)
                     if found_cid:
-                        r = conn.execute("SELECT title, not_fully_idle FROM conversation_summaries WHERE conversation_id = ?", (found_cid,)).fetchone()
+                        r = conn.execute("SELECT title, not_fully_idle, status FROM conversation_summaries WHERE conversation_id = ?", (found_cid,)).fetchone()
                         if r:
                             found_title = r[0]
+                            found_idle = bool(r[1])
+                            found_status = r[2] or ""
                             break
                     else:
-                        r = conn.execute("SELECT conversation_id, title, not_fully_idle FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 1").fetchone()
+                        r = conn.execute("SELECT conversation_id, title, not_fully_idle, status FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 1").fetchone()
                         if r:
                             found_cid = r[0]
                             found_title = r[1]
+                            found_idle = bool(r[2])
+                            found_status = r[3] or ""
                             break
                 except Exception:
                     pass
@@ -1049,6 +1092,8 @@ sys.exit(res.returncode)
             "raw_latest_model": latest_model,
             "transcript_status": status,
             "step_index": latest_step,
+            "not_fully_idle": found_idle,
+            "db_status": found_status,
         }
 
     async def peek_instance(self, pid: int) -> Dict[str, Any]:
@@ -1124,28 +1169,37 @@ if not found_cid:
                 pass
         if found_cid:
             break
-db = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
-if os.path.exists(db):
-    conn = None
-    try:
-        conn = sqlite3.connect(db)
-        if found_cid:
-            r = conn.execute("SELECT title, not_fully_idle FROM conversation_summaries WHERE conversation_id = ?", (found_cid,)).fetchone()
-            if r:
-                found_title = r[0]
-        else:
-            r = conn.execute("SELECT conversation_id, title, not_fully_idle FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 1").fetchone()
-            if r:
-                found_cid = r[0]
-                found_title = r[1]
-    except Exception:
-        pass
-    finally:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
+cand_dbs = [os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")] + glob.glob(os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/conversation_summaries.db"))
+found_idle = False
+found_status = ""
+for db in cand_dbs:
+    if os.path.exists(db):
+        conn = None
+        try:
+            conn = sqlite3.connect(db)
+            if found_cid:
+                r = conn.execute("SELECT title, not_fully_idle, status FROM conversation_summaries WHERE conversation_id = ?", (found_cid,)).fetchone()
+                if r:
+                    found_title = r[0]
+                    found_idle = bool(r[1])
+                    found_status = r[2] or ""
+                    break
+            else:
+                r = conn.execute("SELECT conversation_id, title, not_fully_idle, status FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 1").fetchone()
+                if r:
+                    found_cid = r[0]
+                    found_title = r[1]
+                    found_idle = bool(r[2])
+                    found_status = r[3] or ""
+                    break
+        except Exception:
+            pass
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 content = ""
 status = "unknown"
 latest_step = -1
@@ -1237,13 +1291,16 @@ if found_cid:
                     content = "..." + content[-2700:]
         except Exception:
             pass
-print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_title": found_title, "content": content, "raw_latest_model": latest_model, "transcript_status": status, "step_index": latest_step}))
+print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_title": found_title, "content": content, "raw_latest_model": latest_model, "transcript_status": status, "step_index": latest_step, "not_fully_idle": found_idle, "db_status": found_status}))
 """
             b64_script = base64.b64encode(inspect_code.strip().encode()).decode()
             code_p, out_p, _ = await self.run_raw(f"PEEK_PID={pid} python3 -c \"import base64; exec(base64.b64decode('{b64_script}'))\"", timeout=8)
             res = json.loads(out_p.strip()) if code_p == 0 and out_p.strip() else {}
 
         if res.get("found"):
+            if not is_running and (res.get("not_fully_idle") or re.search(r"(?:^|\s)-p(?:\s|=)", cmd)):
+                is_running = True
+
             res_content = res.get("content", "")
             if is_running and res_content:
                 res_content = self._extract_last_sentences(res_content, max_sentences=5, max_chars=1200)
@@ -1263,6 +1320,9 @@ print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_tit
                 "raw_latest_model": res.get("raw_latest_model"),
                 "step_index": res.get("step_index", -1),
                 "transcript_status": res.get("transcript_status", "unknown"),
+                "not_fully_idle": res.get("not_fully_idle", False),
+                "db_status": res.get("db_status", ""),
+                "status_detail": target_inst.get("status_detail") if target_inst else ("in a goal" if "/goal" in cmd else ("in a prompt" if is_running else None)),
             }
 
         return {

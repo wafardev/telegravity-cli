@@ -284,7 +284,8 @@ def format_instances_view(instances: list[dict]) -> tuple[str, InlineKeyboardMar
         reset_time = inst.get("reset_time")
 
         if is_running:
-            status_text = "🟡 <b>Running</b> <i>(in a prompt)</i>"
+            detail = inst.get("status_detail") or "in a prompt"
+            status_text = f"🟡 <b>Running</b> <i>({html.escape(detail)})</i>"
             row = [
                 InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
                 InlineKeyboardButton(f"🛑 Cancel {pid}", callback_data=f"cancel_task:{pid}"),
@@ -360,7 +361,18 @@ def format_peek_view(info: dict) -> tuple[str, InlineKeyboardMarkup]:
     is_depleted = info.get("is_quota_depleted", False) or ("Individual quota reached" in content) or ("RESOURCE_EXHAUSTED" in content)
 
     if is_running:
-        status_badge = "🟡 <b>Running / Streaming</b> <i>(in a prompt)</i>"
+        status_detail = info.get("status_detail")
+        not_fully_idle = info.get("not_fully_idle")
+        db_status = info.get("db_status", "")
+        if "goal" in cmd or status_detail == "in a goal / autonomous loop":
+            sub = "in a goal / autonomous loop"
+        elif not_fully_idle or "RUNNING" in db_status or status_detail == "awaiting background task":
+            sub = "in a prompt / awaiting task"
+        elif status_detail:
+            sub = status_detail
+        else:
+            sub = "in a prompt"
+        status_badge = f"🟡 <b>Running</b> <i>({sub})</i>"
     elif is_depleted:
         status_badge = "🔴 <b>Quota Depleted</b> <i>(stopped: quota reached)</i>"
     else:
