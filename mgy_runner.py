@@ -724,6 +724,82 @@ sys.exit(res.returncode)
         err_msg = err.strip() or out.strip() or f"gdb exited with code {code}"
         return False, err_msg
 
+    async def inject_escape_to_pid(self, pid: int) -> Tuple[bool, str]:
+        """
+        Injects the Escape key (0x1b) into the process or its TTY/stdin,
+        simulating pressing 'Esc' in the Antigravity conversation to interrupt the task cleanly.
+        Does NOT kill the process and does NOT send SIGINT.
+        """
+        if pid <= 1:
+            return False, "Invalid PID."
+
+        # 1. If it's a tracked asyncio task with stdin pipe, write Escape byte
+        for tid, tinfo in list(self._active_tasks.items()):
+            if tinfo.get("pid") == pid:
+                proc = tinfo.get("proc")
+                if proc and proc.stdin and not proc.stdin.is_closing():
+                    try:
+                        proc.stdin.write(b"\x1b")
+                        await proc.stdin.drain()
+                    except Exception:
+                        pass
+
+        # 2. Collect all descendant PIDs in tree (mgy, agy, etc.)
+        tree_pids = [pid]
+        stack = [pid]
+        while stack:
+            curr = stack.pop()
+            c_code, c_out, _ = await self.run_raw(f"pgrep -P {curr} 2>/dev/null", timeout=5)
+            if c_code == 0 and c_out.strip():
+                for cp in c_out.strip().split():
+                    if cp.isdigit() and int(cp) not in tree_pids:
+                        c_val = int(cp)
+                        tree_pids.append(c_val)
+                        stack.append(c_val)
+
+        # 3. For any process in the tree with interactive TTY, use GDB to inject \x1b into fd 0 (TIOCSTI)
+        injected = False
+        for p in tree_pids:
+            has_tty = await self.has_interactive_tty(p)
+            if has_tty:
+                gdb_script = """import gdb, sys
+try:
+    inf = gdb.selected_inferior()
+    sp = int(gdb.parse_and_eval("$sp"))
+    scratch = sp - 128
+    inf.write_memory(scratch, bytes([0x1b]), 1)
+    res = int(gdb.parse_and_eval(f"(int)ioctl(0, 0x5412, {scratch})"))
+    if res != 0:
+        sys.exit(1)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+"""
+                b64_script = base64.b64encode(gdb_script.strip().encode("utf-8")).decode("ascii")
+                runner_script = f"""import base64, tempfile, subprocess, os, sys
+code = base64.b64decode('{b64_script}')
+f = tempfile.NamedTemporaryFile('wb', suffix='.py', delete=False)
+f.write(code)
+f.close()
+res = subprocess.run(['gdb', '-p', '{p}', '-batch', '-x', f.name], capture_output=True)
+os.unlink(f.name)
+sys.exit(res.returncode)
+"""
+                b64_runner = base64.b64encode(runner_script.strip().encode("utf-8")).decode("ascii")
+                cmd = f"python3 -c \"import base64; exec(base64.b64decode('{b64_runner}'))\""
+                code, _, _ = await self.run_raw(cmd, timeout=10)
+                if code == 0:
+                    injected = True
+
+        # 4. Also write \x1b to /proc/<p>/fd/0 if writable
+        for p in tree_pids:
+            fd0 = f"/proc/{p}/fd/0"
+            code_fd, _, _ = await self.run_raw(f"[ -w {fd0} ] && printf '\\033' > {fd0} 2>/dev/null", timeout=3)
+            if code_fd == 0:
+                injected = True
+
+        return True, f"Sent Escape (Esc) to interrupt task on PID {pid}"
+
     async def kill_process(self, pid: int) -> Tuple[bool, str]:
         """Kills a process and all its child/descendant processes (e.g. agy under mgy)."""
         if pid <= 1:
@@ -832,6 +908,7 @@ sys.exit(res.returncode)
                 try:
                     proc = await asyncio.create_subprocess_shell(
                         full_cmd,
+                        stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         cwd=cwd,
@@ -890,8 +967,8 @@ sys.exit(res.returncode)
         conversation_id: Optional[str] = None,
     ) -> Tuple[int, Optional[int], str]:
         """
-        Cancels any running mgy / agy turn without killing the process.
-        Sends SIGINT (Ctrl+C) to interrupt the prompt/turn cleanly so another task can open.
+        Cancels any running mgy / agy turn without killing the process or sending SIGINT.
+        Sends Escape (Esc key / 0x1b) into the conversation to interrupt the active task cleanly.
         Returns: (returncode, pid, status_message)
         """
         target_pid = pid
@@ -922,35 +999,15 @@ sys.exit(res.returncode)
                         pass
 
         if target_pid:
-            # Collect all descendant PIDs recursively (e.g. tools, agy under mgy)
-            all_to_interrupt = [target_pid]
-            stack = [target_pid]
-            while stack:
-                curr = stack.pop()
-                c_code, c_out, _ = await self.run_raw(f"pgrep -P {curr} 2>/dev/null", timeout=5)
-                if c_code == 0 and c_out.strip():
-                    for cp in c_out.strip().split():
-                        if cp.isdigit() and int(cp) not in all_to_interrupt:
-                            c_val = int(cp)
-                            all_to_interrupt.append(c_val)
-                            stack.append(c_val)
+            # Send Escape (0x1b) to interrupt task cleanly without killing or sigint
+            await self.inject_escape_to_pid(target_pid)
 
-            # Send SIGINT (Ctrl+C) to children in reverse order (bottom-up), then root
-            for p in reversed(all_to_interrupt):
-                await self.run_raw(f"kill -2 {p} 2>/dev/null", timeout=5)
-
-            # Signal asyncio proc if tracked
+            # Release tracked active task so another task can open immediately
             for tid, tinfo in list(self._active_tasks.items()):
                 if tinfo.get("pid") == target_pid or (target_task_id and tid == target_task_id):
-                    proc = tinfo.get("proc")
-                    if proc and proc.returncode is None:
-                        try:
-                            proc.send_signal(signal.SIGINT)
-                        except ProcessLookupError:
-                            pass
                     self._active_tasks.pop(tid, None)
 
-            return 0, target_pid, f"Sent cancel signal (Ctrl+C) to PID {target_pid}"
+            return 0, target_pid, f"Interrupted task on PID {target_pid} (sent Escape key, process kept alive)"
 
         return 0, None, "No active running task found to cancel."
 

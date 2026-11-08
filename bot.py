@@ -228,6 +228,7 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
             buttons.append(InlineKeyboardButton("👁️ Peek", callback_data=f"peek:{pid}"))
             if is_running:
                 buttons.append(InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_task:{pid}"))
+                buttons.append(InlineKeyboardButton("💀 Kill", callback_data=f"kill_inst:{pid}"))
             else:
                 buttons.append(InlineKeyboardButton("🚀 Run", callback_data=f"run_inst:{pid}"))
         buttons.append(InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}"))
@@ -294,6 +295,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     cwd = runner.current_dir or "~"
     target_display = f"{SSH_USER}@{SSH_HOST}:{SSH_PORT}" if RUN_MODE == "ssh" else "Local Machine"
     prof_str = session.get("profile") or "None (select via /new or /conversations)"
+    active_cid = session.get("conversation_id")
     cid_str = active_cid[:8] if active_cid else "None"
 
     welcome_text = (
@@ -360,6 +362,7 @@ def format_instances_view(instances: list[dict]) -> tuple[str, InlineKeyboardMar
             row = [
                 InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
                 InlineKeyboardButton(f"🛑 Cancel {pid}", callback_data=f"cancel_task:{pid}"),
+                InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
             ]
         elif is_depleted:
             reset_desc = f" <i>(resets in {reset_time})</i>" if reset_time else ""
@@ -480,7 +483,10 @@ def format_peek_view(info: dict) -> tuple[str, InlineKeyboardMarkup]:
     ]
     keyboard = [row1]
     if is_running:
-        keyboard.append([InlineKeyboardButton("🛑 Cancel Task", callback_data=f"cancel_task:{pid}")])
+        keyboard.append([
+            InlineKeyboardButton("🛑 Cancel Task", callback_data=f"cancel_task:{pid}"),
+            InlineKeyboardButton("💀 Kill Process", callback_data=f"kill_inst:{pid}"),
+        ])
     else:
         keyboard.append([InlineKeyboardButton("💀 Kill Process", callback_data=f"kill_inst:{pid}")])
 
@@ -646,6 +652,7 @@ async def _wait_for_injected_response(
                         InlineKeyboardButton(f"🚀 Run {pid}", callback_data=f"run_inst:{pid}"),
                         InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
                         InlineKeyboardButton(f"🛑 Cancel {pid}", callback_data=f"cancel_task:{pid}"),
+                        InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
                     ]
                 ]
                 markup = InlineKeyboardMarkup(reply_buttons)
@@ -794,7 +801,10 @@ async def _dispatch_to_pid_or_spawn(
             return
 
         # Fallback for non-interactive / headless PID: dispatch background task
-        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton(f"🛑 Cancel Task (PID: {pid})", callback_data=f"cancel_task:{pid}")]])
+        cancel_btn = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🛑 Cancel Task (PID: {pid})", callback_data=f"cancel_task:{pid}"),
+            InlineKeyboardButton(f"💀 Kill (PID: {pid})", callback_data=f"kill_inst:{pid}"),
+        ]])
         msg_obj = update.message if update.message else None
         if msg_obj:
             status_msg = await msg_obj.reply_html(
@@ -976,7 +986,7 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancels ongoing task execution via SIGINT (Ctrl+C), optionally targeting a specific PID."""
+    """Interrupts ongoing task execution via Escape (Esc key), keeping the process alive."""
     if not await check_auth_or_reject(update):
         return
 
@@ -991,13 +1001,19 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     code, pid, msg = await runner.cancel_active_task(pid=target_pid, conversation_id=sess.get("conversation_id"))
     pid_str = f" (PID: <code>{pid}</code>)" if pid else ""
+    markup = None
+    if pid:
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
+            InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
+        ]])
     if code == 0 and pid:
-        reply_text = f"🛑 <b>Cancelled task{pid_str}</b> (signal sent; process kept alive)"
+        reply_text = f"🛑 <b>Interrupted task{pid_str}</b> (sent Escape key; process kept alive)"
     else:
         reply_text = f"🛑 <b>Cancel Request{pid_str}:</b> {html.escape(msg)}"
 
     if update.message:
-        await update.message.reply_html(reply_text)
+        await update.message.reply_html(reply_text, reply_markup=markup)
 
 
 async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1438,7 +1454,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             except Exception:
                 await query.edit_message_text(f"🛑 Cancelled task{pid_str}", parse_mode="HTML")
         else:
-            await query.edit_message_text(f"🛑 Cancelled task{pid_str}", parse_mode="HTML")
+            action_row = []
+            if pid:
+                action_row.append(InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"))
+                action_row.append(InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"))
+            markup_after = InlineKeyboardMarkup([action_row]) if action_row else None
+            await query.edit_message_text(
+                f"🛑 <b>Interrupted task{pid_str}</b> (sent Escape key, process kept alive)",
+                parse_mode="HTML",
+                reply_markup=markup_after,
+            )
 
 
 async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1511,7 +1536,10 @@ async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         c_pid = target.get("pid") if target else None
         btn_label = f"🛑 Cancel Task (PID: {c_pid})" if c_pid else "🛑 Cancel Task"
         cb_data = f"cancel_task:{c_pid}" if c_pid else "cancel_task"
-        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton(btn_label, callback_data=cb_data)]])
+        action_row = [InlineKeyboardButton(btn_label, callback_data=cb_data)]
+        if c_pid:
+            action_row.append(InlineKeyboardButton(f"💀 Kill ({c_pid})", callback_data=f"kill_inst:{c_pid}"))
+        cancel_btn = InlineKeyboardMarkup([action_row])
         pid_info = f" (PID: <code>{c_pid}</code>)" if c_pid else ""
         if update.message:
             await update.message.reply_html(
@@ -1562,7 +1590,10 @@ async def _execute_and_reply(
         async def on_start_callback(pid: int):
             try:
                 cancel_btn = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton(f"🛑 Cancel Task (PID: {pid})", callback_data=f"cancel_task:{pid}")]]
+                    [[
+                        InlineKeyboardButton(f"🛑 Cancel Task (PID: {pid})", callback_data=f"cancel_task:{pid}"),
+                        InlineKeyboardButton(f"💀 Kill (PID: {pid})", callback_data=f"kill_inst:{pid}"),
+                    ]]
                 )
                 await status_msg.edit_text(
                     f"🚀 <b>Task dispatched to {profile} (PID: <code>{pid}</code>)...</b>\n"
