@@ -358,6 +358,9 @@ def format_peek_view(info: dict) -> tuple[str, InlineKeyboardMarkup]:
 
     is_running = info.get("is_running", False)
     content = info.get("content", "")
+    cmd = info.get("cmd", "")
+    conv_id = info.get("conversation_id")
+    conv_title = info.get("conversation_title")
     is_depleted = info.get("is_quota_depleted", False) or ("Individual quota reached" in content) or ("RESOURCE_EXHAUSTED" in content)
 
     if is_running:
@@ -377,9 +380,6 @@ def format_peek_view(info: dict) -> tuple[str, InlineKeyboardMarkup]:
         status_badge = "🔴 <b>Quota Depleted</b> <i>(stopped: quota reached)</i>"
     else:
         status_badge = "🟢 <b>Ready / Idle</b> <i>(waiting for prompt)</i>"
-    cmd = info.get("cmd", "")
-    conv_id = info.get("conversation_id")
-    conv_title = info.get("conversation_title")
 
     header_lines = [
         f"👁️ <b>Instance Peek (PID: <code>{pid}</code>)</b>",
