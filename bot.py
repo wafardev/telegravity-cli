@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import time
-from typing import Optional, Set
+from typing import Optional, Set, Dict
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -85,6 +85,28 @@ def get_chat_session(chat_id: int) -> dict:
     return chat_sessions[chat_id]
 
 
+# Track prompt retries on definitive Gemini filter blocks: key -> retry_count (0 or 1)
+filter_retry_tracker: Dict[str, int] = {}
+# Cache last sent prompts: key (cid or pid) -> prompt string
+last_sent_prompts: Dict[str, str] = {}
+
+
+async def get_last_prompt_for_target(cid: Optional[str] = None, pid: Optional[int] = None) -> str:
+    """Retrieves the last prompt sent to a session or PID."""
+    if cid and cid in last_sent_prompts and last_sent_prompts[cid]:
+        return last_sent_prompts[cid]
+    if pid and str(pid) in last_sent_prompts and last_sent_prompts[str(pid)]:
+        return last_sent_prompts[str(pid)]
+    if cid:
+        try:
+            prompt = await runner.get_last_user_prompt(cid)
+            if prompt:
+                return prompt
+        except Exception:
+            pass
+    return ""
+
+
 def is_gemini_filter_blocked(text: str) -> bool:
     """Checks if output contains Gemini filter block notification."""
     if not text:
@@ -99,6 +121,7 @@ def format_filter_blocked_message(
     profile: Optional[str],
     step_index: Optional[int],
     is_running: bool,
+    is_retry: bool = False,
 ) -> tuple[str, str]:
     """Formats filter block notification indicating whether session is still running or definitive return."""
     pid_disp = f" (PID: <code>{pid}</code>)" if pid else ""
@@ -110,8 +133,15 @@ def format_filter_blocked_message(
     if title:
         header += f"\n<b>Session:</b> <i>{html.escape(title)}</i>"
 
-    status_icon = "⏳" if is_running else "🛑"
-    status_text = "Task is still running in background." if is_running else "Definitive return (process halted)."
+    if is_running:
+        status_icon = "⏳"
+        status_text = "Task is still running in background."
+    else:
+        status_icon = "🛑"
+        if is_retry:
+            status_text = "Definitive return (second attempt blocked). Process kept idle (ready for next prompt)."
+        else:
+            status_text = "Definitive return (process halted)."
     body = f"🚫 <b>Request blocked.</b>\n{status_icon} <b>Status:</b> {status_text}"
     return header, body
 
@@ -206,6 +236,7 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
     pid = conv_info.get("pid")
     profile = conv_info.get("profile", "")
     step_index = conv_info.get("step_index")
+    retry_key = cid or (str(pid) if pid else profile)
 
     if is_gemini_filter_blocked(output_text):
         is_running = False
@@ -214,14 +245,65 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
         if not is_running and cid:
             is_running = await runner.is_conversation_running(cid)
 
-        header, body = format_filter_blocked_message(
-            cid=cid,
-            title=title,
-            pid=pid,
-            profile=profile,
-            step_index=step_index,
-            is_running=is_running,
-        )
+        if not is_running:
+            # Definitive return! Check if we should retry once with the same prompt
+            attempts = filter_retry_tracker.get(retry_key, 0)
+            if attempts == 0:
+                filter_retry_tracker[retry_key] = 1
+                last_prompt = await get_last_prompt_for_target(cid=cid, pid=pid)
+                if last_prompt:
+                    logger.info("Definitive filter block for %s. Retrying once with prompt: %s", retry_key, last_prompt[:60])
+                    for cid_target in list(known_chats):
+                        try:
+                            await application.bot.send_message(
+                                chat_id=cid_target,
+                                text=(
+                                    f"🚫 <b>Request blocked by Gemini's filters</b>"
+                                    f"{f' for <code>{cid[:8]}</code>' if cid else ''}"
+                                    f"{f' (PID: <code>{pid}</code>)' if pid else ''}:\n\n"
+                                    f"🔄 <i>Retrying once with the same prompt...</i>"
+                                ),
+                                parse_mode="HTML",
+                            )
+                        except Exception as e:
+                            logger.warning("Failed to deliver retry notification: %s", e)
+
+                    # Trigger retry without killing the process
+                    if pid and await runner.has_interactive_tty(pid):
+                        await runner.inject_input_to_pid(pid, last_prompt)
+                    else:
+                        asyncio.create_task(
+                            runner.dispatch_task(
+                                prompt=last_prompt,
+                                profile=profile or "default",
+                                conversation_id=cid,
+                                continue_session=(cid is None),
+                            )
+                        )
+                    return True
+
+            # If second time block: keep it idle too, do NOT kill it!
+            filter_retry_tracker.pop(retry_key, None)
+            header, body = format_filter_blocked_message(
+                cid=cid,
+                title=title,
+                pid=pid,
+                profile=profile,
+                step_index=step_index,
+                is_running=False,
+                is_retry=True,
+            )
+        else:
+            # Task is still actively running in background
+            header, body = format_filter_blocked_message(
+                cid=cid,
+                title=title,
+                pid=pid,
+                profile=profile,
+                step_index=step_index,
+                is_running=True,
+                is_retry=False,
+            )
 
         buttons = []
         if pid:
@@ -231,6 +313,7 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
                 buttons.append(InlineKeyboardButton("💀 Kill", callback_data=f"kill_inst:{pid}"))
             else:
                 buttons.append(InlineKeyboardButton("🚀 Run", callback_data=f"run_inst:{pid}"))
+                buttons.append(InlineKeyboardButton("💀 Kill", callback_data=f"kill_inst:{pid}"))
         buttons.append(InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}"))
         markup = InlineKeyboardMarkup([buttons])
 
@@ -249,7 +332,14 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
         return delivered_any
 
     elif "Individual quota reached" in output_text or "RESOURCE_EXHAUSTED" in output_text or output_text.startswith("⚠️"):
-        header = f"⚠️ <b>Quota Limit Reached!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{cid}</code>)"
+        # ONLY kill the process when quota is depleted!
+        if pid and await runner.is_pid_running(pid):
+            logger.warning("Quota depleted for PID %s (%s). Terminating process.", pid, profile)
+            await runner.kill_process(pid)
+
+        header = f"🔴 <b>Quota Limit Reached!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{cid}</code>)"
+        if pid:
+            header += f"\n<i>Process PID <code>{pid}</code> terminated due to quota exhaustion.</i>"
         keyboard = [
             [
                 InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas"),
@@ -257,6 +347,8 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
             ]
         ]
     else:
+        # Normal / valid response: return answer and keep process idle (do NOT kill process)
+        filter_retry_tracker.pop(retry_key, None)
         pid_disp = f" (PID: <code>{pid}</code>)" if pid else ""
         prof_disp = f" (<b>{html.escape(profile)}</b>)" if profile else ""
         step_disp = f" [Step #{step_index}]" if step_index is not None else ""
@@ -265,6 +357,7 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
         if pid:
             btn_row.append(InlineKeyboardButton("👁️ Peek", callback_data=f"peek:{pid}"))
             btn_row.append(InlineKeyboardButton("🚀 Run", callback_data=f"run_inst:{pid}"))
+            btn_row.append(InlineKeyboardButton("💀 Kill", callback_data=f"kill_inst:{pid}"))
         keyboard = [btn_row]
     markup = InlineKeyboardMarkup(keyboard)
 
@@ -563,6 +656,11 @@ async def _wait_for_injected_response(
     last_delivered_content = initial_content
     responses_delivered = 0
 
+    if initial_cid:
+        last_sent_prompts[initial_cid] = prompt
+    last_sent_prompts[str(pid)] = prompt
+    retry_key = initial_cid or str(pid)
+
     while poll_count < max_idle_polls:
         await asyncio.sleep(0.8)
         poll_count += 1
@@ -590,10 +688,16 @@ async def _wait_for_injected_response(
                 pass
 
             if quota_err:
+                logger.warning("Quota error detected on terminated PID %s. Terminating any lingering processes.", pid)
+                await runner.kill_process(pid)
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas")]])
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"⚠️ <b>Quota Limit Reached on PID <code>{pid}</code> (<b>{html.escape(profile)}</b>)!</b>\n<pre><code>{html.escape(quota_err)}</code></pre>",
+                    text=(
+                        f"🔴 <b>Quota Limit Reached on PID <code>{pid}</code> (<b>{html.escape(profile)}</b>)!</b>\n"
+                        f"<i>Process terminated due to quota exhaustion.</i>\n\n"
+                        f"<pre><code>{html.escape(quota_err)}</code></pre>"
+                    ),
                     parse_mode="HTML",
                     reply_markup=markup,
                 )
@@ -614,13 +718,23 @@ async def _wait_for_injected_response(
         cid = info.get("conversation_id") or initial_cid
         is_running = info.get("is_running", False)
 
-        if is_depleted or "Individual quota reached" in content:
-            # Quota exhausted
+        if cid:
+            retry_key = cid
+            last_sent_prompts[cid] = prompt
+
+        if is_depleted or "Individual quota reached" in content or "RESOURCE_EXHAUSTED" in content:
+            # Quota exhausted: ONLY kill the process when quota is depleted!
+            logger.warning("Quota depleted on PID %s (%s). Terminating process.", pid, profile)
+            await runner.kill_process(pid)
             try:
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas")]])
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"⚠️ <b>Quota Limit Reached on PID <code>{pid}</code> (<b>{html.escape(profile)}</b>)!</b>\n<pre><code>{html.escape(content)}</code></pre>",
+                    text=(
+                        f"🔴 <b>Quota Limit Reached on PID <code>{pid}</code> (<b>{html.escape(profile)}</b>)!</b>\n"
+                        f"<i>Process terminated due to quota exhaustion.</i>\n\n"
+                        f"<pre><code>{html.escape(content)}</code></pre>"
+                    ),
                     parse_mode="HTML",
                     reply_markup=markup,
                 )
@@ -659,21 +773,73 @@ async def _wait_for_injected_response(
                 turn_label = f" (Turn #{responses_delivered})" if responses_delivered > 1 else ""
 
                 if is_gemini_filter_blocked(final_text):
-                    f_hdr, f_body = format_filter_blocked_message(
-                        cid=cid,
-                        title="",
-                        pid=pid,
-                        profile=profile,
-                        step_index=curr_step if curr_step != -1 else None,
-                        is_running=is_running,
-                    )
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"{f_hdr}\n\n{f_body}",
-                        parse_mode="HTML",
-                        reply_markup=markup,
-                    )
+                    if not is_running:
+                        # Definitive return! Check if we should retry once with same prompt
+                        attempts = filter_retry_tracker.get(retry_key, 0)
+                        if attempts == 0:
+                            filter_retry_tracker[retry_key] = 1
+                            logger.info("Definitive filter block on PID %s. Retrying once with same prompt...", pid)
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"🚫 <b>Request blocked by Gemini's filters</b> (PID: <code>{pid}</code>).\n\n"
+                                    f"🔄 <i>Retrying once with the same prompt...</i>"
+                                ),
+                                parse_mode="HTML",
+                            )
+                            # Retry typing prompt into PID without killing process
+                            if await runner.is_pid_running(pid) and await runner.has_interactive_tty(pid):
+                                await runner.inject_input_to_pid(pid, prompt)
+                                # Reset delivered marker to continue watching for retry output
+                                last_delivered_content = ""
+                                poll_count = 0
+                                continue
+                            else:
+                                asyncio.create_task(
+                                    runner.dispatch_task(
+                                        prompt=prompt,
+                                        profile=profile,
+                                        conversation_id=cid,
+                                        continue_session=(cid is None),
+                                    )
+                                )
+                                return
+                        else:
+                            filter_retry_tracker.pop(retry_key, None)
+                            f_hdr, f_body = format_filter_blocked_message(
+                                cid=cid,
+                                title="",
+                                pid=pid,
+                                profile=profile,
+                                step_index=curr_step if curr_step != -1 else None,
+                                is_running=False,
+                                is_retry=True,
+                            )
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"{f_hdr}\n\n{f_body}",
+                                parse_mode="HTML",
+                                reply_markup=markup,
+                            )
+                    else:
+                        f_hdr, f_body = format_filter_blocked_message(
+                            cid=cid,
+                            title="",
+                            pid=pid,
+                            profile=profile,
+                            step_index=curr_step if curr_step != -1 else None,
+                            is_running=True,
+                            is_retry=False,
+                        )
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"{f_hdr}\n\n{f_body}",
+                            parse_mode="HTML",
+                            reply_markup=markup,
+                        )
                 else:
+                    # Normal / valid response: deliver response and keep process idle (do NOT kill process)
+                    filter_retry_tracker.pop(retry_key, None)
                     header = f"💬 <b>Response from PID <code>{pid}</code> (<b>{html.escape(profile)}</b>){turn_label}:</b>"
                     await send_response_or_file(
                         chat_id=chat_id,
@@ -1549,6 +1715,25 @@ async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         return
 
+    # If this conversation has an existing idle instance waiting for a prompt, inject into it directly
+    if conv_id:
+        last_sent_prompts[conv_id] = prompt
+        instances = await runner.get_instances()
+        target_inst = next((i for i in instances if i.get("conversation_id") == conv_id and not i.get("is_running") and not i.get("is_quota_depleted")), None)
+        if target_inst:
+            target_pid = int(target_inst["pid"])
+            last_sent_prompts[str(target_pid)] = prompt
+            await _dispatch_to_pid_or_spawn(
+                update=update,
+                context=context,
+                chat_id=chat_id,
+                pid=target_pid,
+                prompt=prompt,
+                profile=target_inst.get("profile") or profile,
+                cid=conv_id,
+            )
+            return
+
     continue_session = (conv_id is None)
 
     # Initial acknowledgement
@@ -1625,22 +1810,53 @@ async def _execute_and_reply(
         if not output:
             output = "(Task completed with empty output)"
 
+        if conv_id:
+            last_sent_prompts[conv_id] = prompt
+        retry_key = conv_id or profile
+
         if is_gemini_filter_blocked(output):
-            header, body_text = format_filter_blocked_message(
-                cid=conv_id,
-                title="",
-                pid=None,
-                profile=profile,
-                step_index=None,
-                is_running=False,
-            )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"{header}\n\n{body_text}",
-                parse_mode="HTML",
-            )
+            retries = filter_retry_tracker.get(retry_key, 0)
+            if retries == 0:
+                filter_retry_tracker[retry_key] = 1
+                logger.info("Definitive filter block for %s in _execute_and_reply. Retrying once...", retry_key)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🚫 <b>Request blocked by Gemini's filters</b>"
+                        f"{f' for <code>{conv_id[:8]}</code>' if conv_id else ''}"
+                        f" (<b>{html.escape(profile)}</b>).\n\n"
+                        f"🔄 <i>Retrying once with the same prompt...</i>"
+                    ),
+                    parse_mode="HTML",
+                )
+                return await _execute_and_reply(
+                    prompt=prompt,
+                    profile=profile,
+                    conv_id=conv_id,
+                    continue_session=continue_session,
+                    status_msg=status_msg,
+                    preview_prompt=preview_prompt,
+                    chat_id=chat_id,
+                    context=context,
+                )
+            else:
+                filter_retry_tracker.pop(retry_key, None)
+                header, body_text = format_filter_blocked_message(
+                    cid=conv_id,
+                    title="",
+                    pid=None,
+                    profile=profile,
+                    step_index=None,
+                    is_running=False,
+                    is_retry=True,
+                )
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"{header}\n\n{body_text}",
+                    parse_mode="HTML",
+                )
         elif "Individual quota reached" in output or "RESOURCE_EXHAUSTED" in output:
-            header = f"⚠️ <b>Quota Limit Reached (profile: {profile})</b>:"
+            header = f"🔴 <b>Quota Limit Reached (profile: {profile})</b>:\n<i>Task stopped due to quota exhaustion.</i>"
             await send_response_or_file(
                 chat_id=chat_id,
                 bot=context.bot,
@@ -1649,6 +1865,7 @@ async def _execute_and_reply(
                 filename=f"response_{profile}.txt",
             )
         else:
+            filter_retry_tracker.pop(retry_key, None)
             header = f"✅ <b>Task Completed (profile: {profile})</b>:"
             await send_response_or_file(
                 chat_id=chat_id,

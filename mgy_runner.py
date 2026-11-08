@@ -1468,3 +1468,57 @@ print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_tit
             "conversation_title": None,
             "content": "(No conversation or transcript data found for this instance)",
         }
+
+    async def get_last_user_prompt(self, conversation_id: str) -> str:
+        """Retrieves the latest USER_INPUT prompt from transcript.jsonl."""
+        if not conversation_id:
+            return ""
+        if self.mode == "local":
+            return await asyncio.to_thread(self._get_last_user_prompt_sync, conversation_id)
+
+        import base64
+        script = (
+            "import json, os, glob, re\n"
+            f"conv_id = '{conversation_id}'\n"
+            "cand = [os.path.expanduser(f'~/.gemini/antigravity-cli/brain/{conv_id}/.system_generated/logs/transcript.jsonl')] + glob.glob(os.path.expanduser(f'~/.config/multigravity-profiles/*/.gemini/antigravity-cli/brain/{conv_id}/.system_generated/logs/transcript.jsonl'))\n"
+            "path = next((p for p in cand if os.path.exists(p)), None)\n"
+            "prompt = ''\n"
+            "if path and os.path.exists(path):\n"
+            "    try:\n"
+            "        with open(path, 'r', errors='replace') as f: lines = f.readlines()\n"
+            "        for l in reversed(lines):\n"
+            "            d = json.loads(l)\n"
+            "            if d.get('type') == 'USER_INPUT' and d.get('content'):\n"
+            "                raw = d.get('content', '')\n"
+            "                m = re.search(r'<USER_REQUEST>(.*?)</USER_REQUEST>', raw, re.DOTALL)\n"
+            "                prompt = m.group(1).strip() if m else raw.strip()\n"
+            "                break\n"
+            "    except: pass\n"
+            "print(prompt)\n"
+        )
+        b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        code, out, _ = await self.run_raw(f"python3 -c \"import base64; exec(base64.b64decode('{b64}').decode('utf-8'))\"", timeout=10)
+        return out.strip() if code == 0 else ""
+
+    def _get_last_user_prompt_sync(self, conversation_id: str) -> str:
+        import json, os, glob, re
+        cand = [
+            os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{conversation_id}/.system_generated/logs/transcript.jsonl")
+        ] + glob.glob(
+            os.path.expanduser(f"~/.config/multigravity-profiles/*/.gemini/antigravity-cli/brain/{conversation_id}/.system_generated/logs/transcript.jsonl")
+        )
+        path = next((p for p in cand if os.path.exists(p)), None)
+        if path and os.path.exists(path):
+            try:
+                with open(path, "r", errors="replace") as f:
+                    lines = f.readlines()
+                for l in reversed(lines):
+                    d = json.loads(l)
+                    if d.get("type") == "USER_INPUT" and d.get("content"):
+                        raw = d.get("content", "")
+                        m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", raw, re.DOTALL)
+                        return m.group(1).strip() if m else raw.strip()
+            except Exception:
+                pass
+        return ""
+
