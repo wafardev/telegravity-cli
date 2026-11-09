@@ -201,6 +201,42 @@ def format_task_completed_header(
     return f"✅ <b>Task Completed{details}</b>:"
 
 
+def format_quota_depleted_header(
+    profile: Optional[str] = None,
+    cid: Optional[str] = None,
+    title: Optional[str] = None,
+    pid: Optional[int] = None,
+) -> str:
+    """Formats quota limit reached alert header explicitly including the depleted profile name."""
+    prof_disp = f" (profile: <b>{html.escape(profile)}</b>)" if profile else ""
+    header = f"🔴 <b>Quota Limit Reached{prof_disp}!</b>"
+
+    session_desc = ""
+    clean_title = (title or "").strip()
+    is_generic = (
+        not clean_title
+        or clean_title.lower().startswith("active session")
+        or clean_title.lower().startswith("untitled")
+        or clean_title == cid
+    )
+    if not is_generic and cid:
+        if cid[:8] in clean_title:
+            session_desc = html.escape(clean_title)
+        else:
+            session_desc = f"{html.escape(clean_title)} (<code>{cid}</code>)"
+    elif not is_generic:
+        session_desc = html.escape(clean_title)
+    elif cid:
+        session_desc = f"<code>{cid}</code>"
+
+    if session_desc:
+        header += f"\n<b>Session:</b> {session_desc}"
+    if pid:
+        header += f"\n<i>Process PID <code>{pid}</code> terminated due to quota exhaustion.</i>"
+    return header
+
+
+
 
 async def get_last_prompt_for_target(cid: Optional[str] = None, pid: Optional[int] = None) -> str:
     """Retrieves the last prompt sent to a session or PID."""
@@ -453,9 +489,7 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
             logger.info("Quota alert for %s already delivered. Skipping duplicate.", cid)
             return True
 
-        header = f"🔴 <b>Quota Limit Reached!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{cid}</code>)"
-        if pid:
-            header += f"\n<i>Process PID <code>{pid}</code> terminated due to quota exhaustion.</i>"
+        header = format_quota_depleted_header(profile=profile, cid=cid, title=title, pid=pid)
         keyboard = [
             [
                 InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas"),
@@ -822,13 +856,10 @@ async def _wait_for_injected_response(
                 logger.warning("Quota error detected on terminated PID %s. Terminating any lingering processes.", pid)
                 await runner.kill_process(pid)
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas")]])
+                header = format_quota_depleted_header(profile=profile, cid=cid, title=info.get("conversation_title"), pid=pid)
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=(
-                        f"🔴 <b>Quota Limit Reached on PID <code>{pid}</code> (<b>{html.escape(profile)}</b>)!</b>\n"
-                        f"<i>Process terminated due to quota exhaustion.</i>\n\n"
-                        f"<pre><code>{html.escape(quota_err)}</code></pre>"
-                    ),
+                    text=f"{header}\n\n<pre><code>{html.escape(quota_err)}</code></pre>",
                     parse_mode="HTML",
                     reply_markup=markup,
                 )
@@ -859,13 +890,10 @@ async def _wait_for_injected_response(
             await runner.kill_process(pid)
             try:
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas")]])
+                header = format_quota_depleted_header(profile=profile, cid=cid, title=info.get("conversation_title"), pid=pid)
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=(
-                        f"🔴 <b>Quota Limit Reached on PID <code>{pid}</code> (<b>{html.escape(profile)}</b>)!</b>\n"
-                        f"<i>Process terminated due to quota exhaustion.</i>\n\n"
-                        f"<pre><code>{html.escape(content)}</code></pre>"
-                    ),
+                    text=f"{header}\n\n<pre><code>{html.escape(content)}</code></pre>",
                     parse_mode="HTML",
                     reply_markup=markup,
                 )
@@ -1981,7 +2009,7 @@ async def _execute_and_reply(
                 return
 
             title = await get_conversation_title(conv_id) if conv_id else ""
-            header = f"🔴 <b>Quota Limit Reached!</b>\n<b>Session:</b> <code>{html.escape(title or 'Active Session')}</code> (<code>{conv_id}</code>)"
+            header = format_quota_depleted_header(profile=profile, cid=conv_id, title=title)
             keyboard = [
                 [
                     InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas"),

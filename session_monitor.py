@@ -198,8 +198,10 @@ def _poll_scan_sync(handled_map: Dict[str, List[int]], handled_quotas: List[str]
                             if sig not in handled_quotas:
                                 m_conv = re.search(r"conversation[ =]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", log_text)
                                 q_cid = m_conv.group(1) if m_conv else ""
-                                m_prof = re.search(r"multigravity-profiles/([^/]+)/", log_text)
-                                q_prof = m_prof.group(1) if m_prof else ""
+                                m_prof = re.search(r"multigravity-profiles/([^/]+)/", lf)
+                                if not m_prof:
+                                    m_prof = re.search(r"multigravity-profiles/([^/]+)/", log_text)
+                                q_prof = m_prof.group(1) if m_prof else (conv_map.get(q_cid, {}).get("profile") or "default")
                                 q_title = conv_map.get(q_cid, {}).get("title", "Active Task")
                                 new_quotas.append({
                                     "signature": sig,
@@ -396,8 +398,10 @@ def _poll_scan_sync(handled_map, handled_quotas, last_mtimes=None):
                             if sig not in handled_quotas:
                                 m_conv = re.search(r"conversation[ =]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", log_text)
                                 q_cid = m_conv.group(1) if m_conv else ""
-                                m_prof = re.search(r"multigravity-profiles/([^/]+)/", log_text)
-                                q_prof = m_prof.group(1) if m_prof else ""
+                                m_prof = re.search(r"multigravity-profiles/([^/]+)/", lf)
+                                if not m_prof:
+                                    m_prof = re.search(r"multigravity-profiles/([^/]+)/", log_text)
+                                q_prof = m_prof.group(1) if m_prof else (conv_map.get(q_cid, {}).get("profile") or "default")
                                 q_title = conv_map.get(q_cid, {}).get("title", "Active Task")
                                 new_quotas.append({
                                     "signature": sig,
