@@ -392,75 +392,64 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
         if not is_running and cid:
             is_running = await runner.is_conversation_running(cid)
 
-        if not is_running:
-            # Definitive return! Check if we should retry once with the same prompt
-            attempts = filter_retry_tracker.get(retry_key, 0)
-            if attempts == 0:
-                filter_retry_tracker[retry_key] = 1
-                last_prompt = await get_last_prompt_for_target(cid=cid, pid=pid)
-                if last_prompt:
-                    logger.info("Definitive filter block for %s. Retrying once with prompt: %s", retry_key, last_prompt[:60])
-                    for cid_target in list(known_chats):
-                        try:
-                            await application.bot.send_message(
-                                chat_id=cid_target,
-                                text=(
-                                    f"🚫 <b>Request blocked by Gemini's filters</b>"
-                                    f"{f' for <code>{cid[:8]}</code>' if cid else ''}"
-                                    f"{f' (PID: <code>{pid}</code>)' if pid else ''}:\n\n"
-                                    f"🔄 <i>Retrying once with the same prompt...</i>"
-                                ),
-                                parse_mode="HTML",
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to deliver retry notification: %s", e)
+        if is_running:
+            # Request blocked but still running: DO NOT output to telegram!
+            logger.info("Request blocked for %s (PID: %s), but task is still running in background. Suppressing Telegram output.", cid, pid)
+            return False
 
-                    # Trigger retry without killing the process
-                    if pid and await runner.has_interactive_tty(pid):
-                        await runner.inject_input_to_pid(pid, last_prompt)
-                    else:
-                        asyncio.create_task(
-                            runner.dispatch_task(
-                                prompt=last_prompt,
-                                profile=profile or "default",
-                                conversation_id=cid,
-                                continue_session=(cid is None),
-                            )
+        # Definitive return! Check if we should retry once with the same prompt
+        attempts = filter_retry_tracker.get(retry_key, 0)
+        if attempts == 0:
+            filter_retry_tracker[retry_key] = 1
+            last_prompt = await get_last_prompt_for_target(cid=cid, pid=pid)
+            if last_prompt:
+                logger.info("Definitive filter block for %s. Retrying once with prompt: %s", retry_key, last_prompt[:60])
+                for cid_target in list(known_chats):
+                    try:
+                        await application.bot.send_message(
+                            chat_id=cid_target,
+                            text=(
+                                f"🚫 <b>Request blocked by Gemini's filters</b>"
+                                f"{f' for <code>{cid[:8]}</code>' if cid else ''}"
+                                f"{f' (PID: <code>{pid}</code>)' if pid else ''}:\n\n"
+                                f"🔄 <i>Retrying once with the same prompt...</i>"
+                            ),
+                            parse_mode="HTML",
                         )
-                    return True
+                    except Exception as e:
+                        logger.warning("Failed to deliver retry notification: %s", e)
 
-            # If second time block: keep it idle too, do NOT kill it!
-            filter_retry_tracker.pop(retry_key, None)
-            header, body = format_filter_blocked_message(
-                cid=cid,
-                title=title,
-                pid=pid,
-                profile=profile,
-                step_index=step_index,
-                is_running=False,
-                is_retry=True,
-            )
-        else:
-            # Task is still actively running in background
-            header, body = format_filter_blocked_message(
-                cid=cid,
-                title=title,
-                pid=pid,
-                profile=profile,
-                step_index=step_index,
-                is_running=True,
-                is_retry=False,
-            )
+                # Trigger retry without killing the process
+                if pid and await runner.has_interactive_tty(pid):
+                    await runner.inject_input_to_pid(pid, last_prompt)
+                else:
+                    asyncio.create_task(
+                        runner.dispatch_task(
+                            prompt=last_prompt,
+                            profile=profile or "default",
+                            conversation_id=cid,
+                            continue_session=(cid is None),
+                        )
+                    )
+                return True
+
+        # If second time block: keep it idle too, do NOT kill it!
+        filter_retry_tracker.pop(retry_key, None)
+        header, body = format_filter_blocked_message(
+            cid=cid,
+            title=title,
+            pid=pid,
+            profile=profile,
+            step_index=step_index,
+            is_running=False,
+            is_retry=True,
+        )
 
         buttons = []
         if pid:
             buttons.append(InlineKeyboardButton("👁️ Peek", callback_data=f"peek:{pid}"))
-            if is_running:
-                buttons.append(InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_task:{pid}"))
-                buttons.append(InlineKeyboardButton("💀 Kill", callback_data=f"kill_inst:{pid}"))
-            else:
-                buttons.append(InlineKeyboardButton("🚀 Run", callback_data=f"run_inst:{pid}"))
-                buttons.append(InlineKeyboardButton("💀 Kill", callback_data=f"kill_inst:{pid}"))
+            buttons.append(InlineKeyboardButton("🚀 Run", callback_data=f"run_inst:{pid}"))
+            buttons.append(InlineKeyboardButton("💀 Kill", callback_data=f"kill_inst:{pid}"))
         buttons.append(InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}"))
         markup = InlineKeyboardMarkup([buttons])
 
@@ -981,21 +970,9 @@ async def _wait_for_injected_response(
                                 reply_markup=markup,
                             )
                     else:
-                        f_hdr, f_body = format_filter_blocked_message(
-                            cid=cid,
-                            title="",
-                            pid=pid,
-                            profile=profile,
-                            step_index=curr_step if curr_step != -1 else None,
-                            is_running=True,
-                            is_retry=False,
-                        )
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"{f_hdr}\n\n{f_body}",
-                            parse_mode="HTML",
-                            reply_markup=markup,
-                        )
+                        # Request blocked but task is still running in background: DO NOT output to telegram!
+                        logger.info("Request blocked on PID %s, but task is still running in background. Suppressing Telegram output.", pid)
+                        continue
                 else:
                     # Check if final_text contains quota error or is empty
                     if "Individual quota reached" in final_text or "RESOURCE_EXHAUSTED" in final_text:
