@@ -6,6 +6,7 @@ Integrates multigravity (mgy) task dispatching with real-time session completion
 
 import asyncio
 import glob
+import hashlib
 import html
 import io
 import logging
@@ -89,6 +90,116 @@ def get_chat_session(chat_id: int) -> dict:
 filter_retry_tracker: Dict[str, int] = {}
 # Cache last sent prompts: key (cid or pid) -> prompt string
 last_sent_prompts: Dict[str, str] = {}
+# Cache conversation titles: cid -> title
+conv_titles_cache: Dict[str, str] = {}
+# Deduplication cache: key (cid:step or cid:hash) -> delivery timestamp
+delivered_responses_cache: Dict[str, float] = {}
+
+
+def normalize_model_output(text: str) -> str:
+    """Normalizes output text by stripping common CLI prefix wrappers."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"^Starting (?:agy|mgy) with profile [^\n]+\.\.\.\s*", "", text.strip())
+    cleaned = re.sub(r"^🚀 [^\n]+\.\.\.\s*", "", cleaned)
+    return cleaned.strip()
+
+
+def mark_response_delivered(
+    cid: Optional[str],
+    step_index: Optional[int],
+    content: str,
+    window_seconds: float = 120.0,
+) -> bool:
+    """
+    Checks if a response has already been delivered for this conversation/step/content.
+    If already delivered within window_seconds, returns False (duplicate).
+    If new, marks it as delivered and returns True.
+    """
+    now = time.time()
+    # Expire old entries older than 300 seconds
+    to_delete = [k for k, ts in delivered_responses_cache.items() if now - ts > 300]
+    for k in to_delete:
+        delivered_responses_cache.pop(k, None)
+
+    keys = []
+    if cid and step_index is not None and step_index >= 0:
+        keys.append(f"{cid}:step:{step_index}")
+
+    clean = normalize_model_output(content)
+    if clean:
+        norm_clean = "".join(clean.split())[:600]
+        content_hash = hashlib.sha256(norm_clean.encode("utf-8")).hexdigest()[:16]
+        if cid:
+            keys.append(f"{cid}:hash:{content_hash}")
+        else:
+            keys.append(f"global:hash:{content_hash}")
+
+    for k in keys:
+        if k in delivered_responses_cache:
+            if now - delivered_responses_cache[k] < window_seconds:
+                return False  # Duplicate!
+
+    for k in keys:
+        delivered_responses_cache[k] = now
+    return True
+
+
+async def get_conversation_title(cid: str) -> str:
+    """Retrieves conversation title/label for cid, querying database cache if not yet cached."""
+    if not cid:
+        return ""
+    if cid in conv_titles_cache and conv_titles_cache[cid]:
+        return conv_titles_cache[cid]
+    try:
+        convs = await monitor.get_recent_conversations(limit=30)
+        for c in convs:
+            c_id = c.get("conversation_id")
+            c_title = c.get("title", "")
+            if c_id and c_title:
+                conv_titles_cache[c_id] = c_title
+        if cid in conv_titles_cache:
+            return conv_titles_cache[cid]
+    except Exception as e:
+        logger.debug("Could not fetch conversation title for %s: %s", cid, e)
+    return ""
+
+
+def format_task_completed_header(
+    profile: Optional[str] = None,
+    cid: Optional[str] = None,
+    title: Optional[str] = None,
+) -> str:
+    """Formats a concise 'Task Completed' header with profile name and conversation."""
+    parts = []
+    if profile:
+        parts.append(f"profile: <b>{html.escape(profile)}</b>")
+
+    conv_disp = ""
+    clean_title = (title or "").strip()
+    is_generic = (
+        not clean_title
+        or clean_title.lower().startswith("active session")
+        or clean_title.lower().startswith("untitled")
+        or clean_title == cid
+    )
+
+    if not is_generic and cid:
+        if cid[:8] in clean_title:
+            conv_disp = html.escape(clean_title)
+        else:
+            conv_disp = f"<b>{html.escape(clean_title)}</b> (<code>{cid[:8]}</code>)"
+    elif not is_generic:
+        conv_disp = f"<b>{html.escape(clean_title)}</b>"
+    elif cid:
+        conv_disp = f"<code>{cid[:8]}</code>"
+
+    if conv_disp:
+        parts.append(f"conv: {conv_disp}")
+
+    details = f" ({', '.join(parts)})" if parts else ""
+    return f"✅ <b>Task Completed{details}</b>:"
+
 
 
 async def get_last_prompt_for_target(cid: Optional[str] = None, pid: Optional[int] = None) -> str:
@@ -349,10 +460,15 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
     else:
         # Normal / valid response: return answer and keep process idle (do NOT kill process)
         filter_retry_tracker.pop(retry_key, None)
-        pid_disp = f" (PID: <code>{pid}</code>)" if pid else ""
-        prof_disp = f" (<b>{html.escape(profile)}</b>)" if profile else ""
-        step_disp = f" [Step #{step_index}]" if step_index is not None else ""
-        header = f"💬 <b>Response from <code>{cid}</code>{pid_disp}{prof_disp}{step_disp}:</b>\n<b>Session:</b> <i>{html.escape(title)}</i>"
+        if cid and title:
+            conv_titles_cache[cid] = title
+
+        # Deduplication check: if already delivered, skip duplicate
+        if not mark_response_delivered(cid, step_index, output_text):
+            logger.info("Task response for %s (step %s) already delivered. Skipping duplicate.", cid, step_index)
+            return True
+
+        header = format_task_completed_header(profile=profile, cid=cid, title=title)
         btn_row = [InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}")]
         if pid:
             btn_row.append(InlineKeyboardButton("👁️ Peek", callback_data=f"peek:{pid}"))
@@ -840,15 +956,21 @@ async def _wait_for_injected_response(
                 else:
                     # Normal / valid response: deliver response and keep process idle (do NOT kill process)
                     filter_retry_tracker.pop(retry_key, None)
-                    header = f"💬 <b>Response from PID <code>{pid}</code> (<b>{html.escape(profile)}</b>){turn_label}:</b>"
-                    await send_response_or_file(
-                        chat_id=chat_id,
-                        bot=context.bot,
-                        text=final_text,
-                        header=header,
-                        filename=f"response_{pid}.txt",
-                        reply_markup=markup,
-                    )
+                    if not mark_response_delivered(cid, curr_step, final_text):
+                        logger.info("Response for %s (step %s) already delivered. Skipping duplicate.", cid, curr_step)
+                    else:
+                        conv_title = info.get("conversation_title")
+                        if cid and conv_title:
+                            conv_titles_cache[cid] = conv_title
+                        header = format_task_completed_header(profile=profile, cid=cid, title=conv_title)
+                        await send_response_or_file(
+                            chat_id=chat_id,
+                            bot=context.bot,
+                            text=final_text,
+                            header=header,
+                            filename=f"response_{cid[:8] if cid else pid}.txt",
+                            reply_markup=markup,
+                        )
             else:
                 logger.info("Response for %s (step %s) already delivered by SessionMonitor.", cid, curr_step)
 
@@ -1866,13 +1988,24 @@ async def _execute_and_reply(
             )
         else:
             filter_retry_tracker.pop(retry_key, None)
-            header = f"✅ <b>Task Completed (profile: {profile})</b>:"
+            clean_output = normalize_model_output(output)
+            if not mark_response_delivered(conv_id, None, clean_output):
+                logger.info("Task completion for %s already delivered by SessionMonitor. Skipping duplicate.", conv_id)
+                return
+
+            title = await get_conversation_title(conv_id) if conv_id else ""
+            header = format_task_completed_header(profile=profile, cid=conv_id, title=title)
+            btn_row = []
+            if conv_id:
+                btn_row.append(InlineKeyboardButton("💬 Select", callback_data=f"resume:{conv_id}"))
+            markup = InlineKeyboardMarkup([btn_row]) if btn_row else None
             await send_response_or_file(
                 chat_id=chat_id,
                 bot=context.bot,
-                text=output,
+                text=clean_output,
                 header=header,
-                filename=f"response_{profile}.txt",
+                filename=f"response_{conv_id[:8] if conv_id else profile}.txt",
+                reply_markup=markup,
             )
 
     except Exception as e:
