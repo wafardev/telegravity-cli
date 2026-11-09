@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import time
-from typing import Optional, Set, Dict
+from typing import Optional, Set, Dict, Any, Tuple
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -448,9 +448,14 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
         buttons = []
         if pid:
             buttons.append(InlineKeyboardButton("👁️ Peek", callback_data=f"peek:{pid}"))
-            buttons.append(InlineKeyboardButton("🚀 Run", callback_data=f"run_inst:{pid}"))
+            buttons.append(InlineKeyboardButton("▶️ Continue", callback_data=f"continue_inst:{pid}"))
             buttons.append(InlineKeyboardButton("💀 Kill", callback_data=f"kill_inst:{pid}"))
-        buttons.append(InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}"))
+        elif cid:
+            buttons.append(InlineKeyboardButton("▶️ Continue", callback_data=f"continue_conv:{cid}"))
+            buttons.append(InlineKeyboardButton("🔍 Preview", callback_data=f"preview:{cid}"))
+            buttons.append(InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}"))
+        else:
+            buttons.append(InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}"))
         markup = InlineKeyboardMarkup([buttons])
 
         delivered_any = False
@@ -507,10 +512,16 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
             return True
 
         header = format_task_completed_header(profile=profile, cid=cid, title=title)
-        btn_row = [InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}")]
+        btn_row = []
+        if cid:
+            btn_row.append(InlineKeyboardButton("▶️ Continue", callback_data=f"continue_conv:{cid}"))
+            btn_row.append(InlineKeyboardButton("🔍 Preview", callback_data=f"preview:{cid}"))
+            btn_row.append(InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}"))
+        elif pid:
+            btn_row.append(InlineKeyboardButton("▶️ Continue", callback_data=f"continue_inst:{pid}"))
+
         if pid:
             btn_row.append(InlineKeyboardButton("👁️ Peek", callback_data=f"peek:{pid}"))
-            btn_row.append(InlineKeyboardButton("🚀 Run", callback_data=f"run_inst:{pid}"))
             btn_row.append(InlineKeyboardButton("💀 Kill", callback_data=f"kill_inst:{pid}"))
         keyboard = [btn_row]
     markup = InlineKeyboardMarkup(keyboard)
@@ -557,6 +568,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• /quotas - Get all mgy quotas per account.\n"
         f"• /accounts - List all mgy accounts on the device.\n"
         f"• /conversations - List imported conversations.\n"
+        f"• /continue [cid] - Continue a conversation session.\n"
+        f"• /preview [cid] - Preview conversation history without opening.\n"
         f"• /peek &lt;pid&gt; - Get latest answer or stream from instance.\n"
         f"• /run &lt;pid&gt; [prompt] - Run a prompt on a specific instance.\n"
         f"• /new &lt;profile&gt; [conv] - Bind session to profile & conversation.\n"
@@ -616,14 +629,14 @@ def format_instances_view(instances: list[dict]) -> tuple[str, InlineKeyboardMar
             status_text = f"🔴 <b>Quota Depleted</b>{reset_desc}"
             row = [
                 InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
-                InlineKeyboardButton(f"🚀 Run {pid}", callback_data=f"run_inst:{pid}"),
+                InlineKeyboardButton(f"▶️ Continue {pid}", callback_data=f"continue_inst:{pid}"),
                 InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
             ]
         else:
             status_text = "🟢 <b>Ready</b> <i>(waiting for a prompt)</i>"
             row = [
                 InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
-                InlineKeyboardButton(f"🚀 Run {pid}", callback_data=f"run_inst:{pid}"),
+                InlineKeyboardButton(f"▶️ Continue {pid}", callback_data=f"continue_inst:{pid}"),
                 InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
             ]
 
@@ -726,8 +739,10 @@ def format_peek_view(info: dict) -> tuple[str, InlineKeyboardMarkup]:
 
     row1 = [
         InlineKeyboardButton("🔄 Refresh", callback_data=f"peek:{pid}"),
-        InlineKeyboardButton("🚀 Run", callback_data=f"run_inst:{pid}"),
+        InlineKeyboardButton("▶️ Continue", callback_data=f"continue_inst:{pid}"),
     ]
+    if cid:
+        row1.append(InlineKeyboardButton("🔍 Preview", callback_data=f"preview:{cid}"))
     keyboard = [row1]
     if is_running:
         keyboard.append([
@@ -911,12 +926,14 @@ async def _wait_for_injected_response(
                 responses_delivered += 1
                 reply_buttons = [
                     [
-                        InlineKeyboardButton(f"🚀 Run {pid}", callback_data=f"run_inst:{pid}"),
+                        InlineKeyboardButton(f"▶️ Continue", callback_data=f"continue_inst:{pid}"),
                         InlineKeyboardButton(f"👁️ Peek {pid}", callback_data=f"peek:{pid}"),
                         InlineKeyboardButton(f"🛑 Cancel {pid}", callback_data=f"cancel_task:{pid}"),
                         InlineKeyboardButton(f"💀 Kill {pid}", callback_data=f"kill_inst:{pid}"),
                     ]
                 ]
+                if cid:
+                    reply_buttons.append([InlineKeyboardButton("🔍 Preview", callback_data=f"preview:{cid}")])
                 markup = InlineKeyboardMarkup(reply_buttons)
                 turn_label = f" (Turn #{responses_delivered})" if responses_delivered > 1 else ""
 
@@ -1452,11 +1469,18 @@ async def conversations_command(update: Update, context: ContextTypes.DEFAULT_TY
             p = inst.get("pid")
             prof = html.escape(inst.get("profile", "default"))
             st_line = f"🔴 <b>In Use</b> (PID <code>{p}</code> — <b>{prof}</b>)"
-            keyboard.append([InlineKeyboardButton(f"🔴 Select {cid}", callback_data=f"resume:{cid}")])
-            keyboard.append([InlineKeyboardButton(f"👁️ Peek PID {p} ({prof})", callback_data=f"peek:{p}")])
+            keyboard.append([
+                InlineKeyboardButton("▶️ Continue", callback_data=f"continue_conv:{cid}"),
+                InlineKeyboardButton("🔍 Preview", callback_data=f"preview:{cid}"),
+                InlineKeyboardButton(f"👁️ Peek {p}", callback_data=f"peek:{p}"),
+            ])
         else:
             st_line = "🟢 <b>Not Used</b> (Idle)"
-            keyboard.append([InlineKeyboardButton(f"🟢 Select {cid}", callback_data=f"resume:{cid}")])
+            keyboard.append([
+                InlineKeyboardButton("▶️ Continue", callback_data=f"continue_conv:{cid}"),
+                InlineKeyboardButton("🔍 Preview", callback_data=f"preview:{cid}"),
+                InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}"),
+            ])
 
         lines.append(
             f"• <b><code>{cid}</code></b> — {size_mb} MB ({steps:,} steps)\n"
@@ -1469,6 +1493,205 @@ async def conversations_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     if update.message:
         await update.message.reply_html(text, reply_markup=markup)
+
+
+def format_conversation_preview_card(
+    preview: Dict[str, Any],
+    open_inst: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, InlineKeyboardMarkup]:
+    """Formats a structured preview of a conversation without needing an active running process."""
+    cid = preview.get("conversation_id", "")
+    title = preview.get("title") or "(untitled)"
+    profile = preview.get("profile") or "default"
+    step_count = preview.get("step_count", 0)
+    status = preview.get("status", "idle")
+    last_mod = preview.get("last_modified") or "unknown"
+    last_prompt = preview.get("last_user_prompt", "").strip()
+    latest_output = preview.get("latest_output", "").strip()
+    size_mb = preview.get("size_mb", 0.0)
+
+    # Status formatting
+    is_running = False
+    open_pid = None
+    if open_inst:
+        open_pid = open_inst.get("pid")
+        is_running = open_inst.get("is_running", False)
+        if is_running:
+            st_badge = f"🟡 <b>Running</b> (PID <code>{open_pid}</code>)"
+        else:
+            st_badge = f"🟢 <b>Open / Idle</b> (PID <code>{open_pid}</code>)"
+    else:
+        st_badge = f"⚪ <b>Closed / Idle</b>"
+
+    p_snippet = last_prompt if last_prompt else "(No user prompt recorded)"
+    if len(p_snippet) > 800:
+        p_snippet = p_snippet[:797] + "..."
+
+    o_snippet = latest_output if latest_output else "(No model output recorded)"
+    if len(o_snippet) > 1800:
+        o_snippet = o_snippet[:1797] + "..."
+
+    text = (
+        f"🔍 <b>Conversation Preview</b>\n\n"
+        f"• <b>Title:</b> <b>{html.escape(title)}</b>\n"
+        f"• <b>Session ID:</b> <code>{cid}</code>\n"
+        f"• <b>Account:</b> <b>{html.escape(profile)}</b>\n"
+        f"• <b>Status:</b> {st_badge}\n"
+        f"• <b>History:</b> {step_count:,} steps ({size_mb} MB)\n"
+        f"• <b>Last Active:</b> <code>{html.escape(last_mod)}</code>\n\n"
+        f"👤 <b>Last User Prompt:</b>\n"
+        f"<code>{html.escape(p_snippet)}</code>\n\n"
+        f"💬 <b>Latest Model Output:</b>\n"
+        f"<pre><code>{html.escape(o_snippet)}</code></pre>"
+    )
+
+    buttons = []
+    btn_row1 = [
+        InlineKeyboardButton("▶️ Continue", callback_data=f"continue_conv:{cid}"),
+        InlineKeyboardButton("💬 Select", callback_data=f"resume:{cid}"),
+    ]
+    if open_pid:
+        btn_row1.append(InlineKeyboardButton(f"👁️ Peek {open_pid}", callback_data=f"peek:{open_pid}"))
+    buttons.append(btn_row1)
+
+    if open_pid:
+        btn_row2 = []
+        if is_running:
+            btn_row2.append(InlineKeyboardButton(f"🛑 Cancel Task ({open_pid})", callback_data=f"cancel_task:{open_pid}"))
+        btn_row2.append(InlineKeyboardButton(f"💀 Kill ({open_pid})", callback_data=f"kill_inst:{open_pid}"))
+        buttons.append(btn_row2)
+
+    buttons.append([InlineKeyboardButton("📋 All Conversations", callback_data="do_conversations")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def preview_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Previews conversation history without opening it: /preview [conv_id]"""
+    if not await check_auth_or_reject(update):
+        return
+
+    cid_arg = context.args[0].strip() if context.args else None
+    if cid_arg:
+        if update.message:
+            await update.message.reply_chat_action(ChatAction.TYPING)
+
+        preview = await runner.preview_conversation(cid_arg)
+        if not preview or not preview.get("conversation_id"):
+            if update.message:
+                await update.message.reply_html(
+                    f"❌ <b>Conversation not found:</b> <code>{html.escape(cid_arg)}</code>\n"
+                    f"Use /conversations or /preview without arguments to view available sessions."
+                )
+            return
+
+        cid = preview["conversation_id"]
+        instances = await runner.get_instances()
+        open_inst = next((i for i in instances if i.get("conversation_id") == cid), None)
+        text, markup = format_conversation_preview_card(preview, open_inst)
+        if update.message:
+            await update.message.reply_html(text, reply_markup=markup)
+        return
+
+    if update.message:
+        await update.message.reply_chat_action(ChatAction.TYPING)
+
+    convs = await runner.list_conversations()
+    if not convs:
+        if update.message:
+            await update.message.reply_html("ℹ️ <i>No conversations found to preview.</i>")
+        return
+
+    instances = await runner.get_instances()
+    active_instances = {inst.get("conversation_id"): inst for inst in instances if inst.get("conversation_id")}
+
+    keyboard = []
+    lines = ["🔍 <b>Select a conversation to preview:</b>\n"]
+    for c in convs[:12]:
+        cid = c["id"]
+        title = html.escape(c.get("title", "(untitled)"))
+        steps = c.get("step_count", 0)
+        inst = active_instances.get(cid)
+        st_icon = "🟡" if inst and inst.get("is_running") else ("🟢" if inst else "⚪")
+
+        lines.append(f"• {st_icon} <b>{title}</b>\n  <code>{cid[:8]}</code> ({steps:,} steps)")
+        keyboard.append([
+            InlineKeyboardButton(f"🔍 Preview {cid[:8]}", callback_data=f"preview:{cid}"),
+            InlineKeyboardButton("▶️ Continue", callback_data=f"continue_conv:{cid}"),
+        ])
+
+    keyboard.append([InlineKeyboardButton("📋 All Conversations", callback_data="do_conversations")])
+    if update.message:
+        await update.message.reply_html("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Continues a conversation: /continue [conv_id]"""
+    if not await check_auth_or_reject(update):
+        return
+
+    chat_id = update.effective_chat.id
+    cid_arg = context.args[0].strip() if context.args else None
+
+    if not cid_arg:
+        sess = get_chat_session(chat_id)
+        cid_arg = sess.get("conversation_id")
+
+    if cid_arg:
+        preview = await runner.preview_conversation(cid_arg)
+        cid = preview.get("conversation_id") or cid_arg
+        prof = preview.get("profile") or runner.default_profile or "default"
+        title = preview.get("title") or ""
+
+        instances = await runner.get_instances()
+        running_inst = next((i for i in instances if i.get("conversation_id") == cid and i.get("is_running")), None)
+        if running_inst:
+            if update.message:
+                await update.message.reply_html(
+                    f"⚠️ Conversation <code>{cid[:8]}</code> is currently executing a task (PID {running_inst.get('pid')}).\n"
+                    f"Please wait or cancel it before sending a new prompt."
+                )
+            return
+
+        idle_inst = next((i for i in instances if i.get("conversation_id") == cid and not i.get("is_running") and not i.get("is_quota_depleted")), None)
+        pid = int(idle_inst["pid"]) if idle_inst else None
+        if idle_inst and idle_inst.get("profile"):
+            prof = idle_inst.get("profile")
+
+        context.user_data["pending_run"] = {
+            "profile": prof,
+            "conversation_id": cid,
+            "pid": pid,
+        }
+        sess = get_chat_session(chat_id)
+        sess["conversation_id"] = cid
+        sess["profile"] = prof
+
+        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Prompt", callback_data="cancel_pending_run")]])
+        title_disp = f" <b>{html.escape(title)}</b>" if title else ""
+        pid_disp = f" (PID: <code>{pid}</code>)" if pid else ""
+        if update.message:
+            await update.message.reply_html(
+                f"▶️ <b>Continuing session:</b>{title_disp} (<code>{cid[:8]}</code>)\n"
+                f"• <b>Account:</b> <b>{html.escape(prof)}</b>{pid_disp}\n\n"
+                f"💬 <i>Send the prompt to continue the conversation:</i>",
+                reply_markup=cancel_btn,
+            )
+        return
+
+    convs = await runner.list_conversations()
+    keyboard = []
+    for c in convs[:8]:
+        cid = c["id"]
+        title = html.escape(c.get("title", "(untitled)"))
+        keyboard.append([
+            InlineKeyboardButton(f"▶️ Continue: {title[:25]}", callback_data=f"continue_conv:{cid}"),
+            InlineKeyboardButton(f"🔍 Preview", callback_data=f"preview:{cid}"),
+        ])
+    if update.message:
+        await update.message.reply_html(
+            "▶️ <b>Select a conversation to continue:</b>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1677,7 +1900,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         rst_str = f" Resets in {rst}." if rst else ""
         await query.answer(f"🔴 Instance {pid} stopped: Quota reached.{rst_str}\nSwitch accounts with /new or check /quotas.", show_alert=True)
 
-    elif data.startswith("run_inst:"):
+    elif data.startswith("continue_inst:") or data.startswith("run_inst:"):
         pid_str = data.split(":", 1)[1]
         try:
             pid = int(pid_str)
@@ -1695,17 +1918,162 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "profile": prof,
                 "conversation_id": cid,
             }
+            if chat_id:
+                sess = get_chat_session(chat_id)
+                sess["profile"] = prof
+                if cid:
+                    sess["conversation_id"] = cid
 
             cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Prompt", callback_data="cancel_pending_run")]])
             cid_disp = f" (conv: <code>{cid[:8]}</code>)" if cid else ""
+            title = await get_conversation_title(cid) if cid else ""
+            title_disp = f" <b>{html.escape(title)}</b>" if title else ""
             await query.message.reply_html(
-                f"🚀 <b>Run on PID <code>{pid}</code></b> (profile: <b>{prof}</b>{cid_disp})\n\n"
-                f"<i>Send the prompt to insert:</i>",
+                f"▶️ <b>Continue on PID <code>{pid}</code></b>{title_disp} (profile: <b>{prof}</b>{cid_disp})\n\n"
+                f"💬 <i>Send the prompt to continue the conversation:</i>",
                 reply_markup=cancel_btn,
             )
             await query.answer()
         except Exception as e:
             await query.answer(f"Error: {e}")
+
+    elif data.startswith("continue_conv:"):
+        cid = data.split(":", 1)[1]
+        try:
+            instances = await runner.get_instances()
+            running_inst = next((i for i in instances if i.get("conversation_id") == cid and i.get("is_running")), None)
+            if running_inst:
+                await query.answer(f"⚠️ Conversation {cid[:8]} is currently executing a task (PID {running_inst.get('pid')}). Wait or cancel.", show_alert=True)
+                return
+
+            idle_inst = next((i for i in instances if i.get("conversation_id") == cid and not i.get("is_running") and not i.get("is_quota_depleted")), None)
+            pid = int(idle_inst["pid"]) if idle_inst else None
+
+            prof = idle_inst.get("profile") if idle_inst else None
+            if not prof and chat_id:
+                sess = get_chat_session(chat_id)
+                if sess.get("conversation_id") == cid:
+                    prof = sess.get("profile")
+
+            if not prof:
+                prev = await runner.preview_conversation(cid)
+                if prev and prev.get("profile") and prev.get("profile") != "default":
+                    prof = prev.get("profile")
+
+            if not prof:
+                context.user_data["selected_conv_id"] = cid
+                profiles = await runner.list_profiles()
+                if profiles:
+                    buttons = []
+                    row = []
+                    for p in profiles:
+                        p_name = p["name"]
+                        row.append(InlineKeyboardButton(p_name, callback_data=f"sel_conv_prof:{p_name}"))
+                        if len(row) == 2:
+                            buttons.append(row)
+                            row = []
+                    if row:
+                        buttons.append(row)
+                    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_prof_select")])
+                    await query.edit_message_text(
+                        f"👤 <b>Select an account / profile to continue conversation <code>{cid[:8]}</code>:</b>",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(buttons),
+                    )
+                    await query.answer()
+                    return
+                prof = runner.default_profile or "default"
+
+            context.user_data["pending_run"] = {
+                "profile": prof,
+                "conversation_id": cid,
+                "pid": pid,
+            }
+            if chat_id:
+                sess = get_chat_session(chat_id)
+                sess["conversation_id"] = cid
+                sess["profile"] = prof
+
+            title = await get_conversation_title(cid)
+            title_disp = f" <b>{html.escape(title)}</b>" if title else ""
+            pid_disp = f" (PID: <code>{pid}</code>)" if pid else ""
+            cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Prompt", callback_data="cancel_pending_run")]])
+            await query.message.reply_html(
+                f"▶️ <b>Continuing session:</b>{title_disp} (<code>{cid[:8]}</code>)\n"
+                f"• <b>Account:</b> <b>{html.escape(prof)}</b>{pid_disp}\n\n"
+                f"💬 <i>Send the prompt to continue the conversation:</i>",
+                reply_markup=cancel_btn,
+            )
+            await query.answer()
+        except Exception as e:
+            logger.error("Error continuing conversation %s: %s", cid, e)
+            await query.answer(f"Error: {e}")
+
+    elif data.startswith("preview:"):
+        cid = data.split(":", 1)[1]
+        try:
+            preview = await runner.preview_conversation(cid)
+            if not preview or not preview.get("conversation_id"):
+                await query.answer(f"Conversation {cid[:8]} not found or not initialized.", show_alert=True)
+                return
+
+            instances = await runner.get_instances()
+            open_inst = next((i for i in instances if i.get("conversation_id") == preview["conversation_id"]), None)
+            text, markup = format_conversation_preview_card(preview, open_inst)
+            try:
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            except Exception:
+                await query.message.reply_html(text, reply_markup=markup)
+            await query.answer()
+        except Exception as e:
+            logger.error("Error previewing conversation %s: %s", cid, e)
+            await query.answer(f"Error previewing: {e}", show_alert=True)
+
+    elif data == "do_conversations":
+        convs, instances = await asyncio.gather(
+            runner.get_imported_conversations(),
+            runner.get_instances(),
+        )
+        if not convs:
+            await query.answer("No conversations found.", show_alert=True)
+            return
+        active_instances = {inst.get("conversation_id"): inst for inst in instances if inst.get("conversation_id")}
+        lines = ["📁 <b>Conversations:</b>"]
+        keyboard = []
+        for c in convs:
+            c_id = c["id"]
+            title = html.escape(c.get("title", "(untitled)"))
+            steps = c.get("step_count", 0)
+            size_mb = c.get("total_size_mb", 0)
+            inst = active_instances.get(c_id)
+            if inst:
+                p = inst.get("pid")
+                prof = html.escape(inst.get("profile", "default"))
+                st_line = f"🔴 <b>In Use</b> (PID <code>{p}</code> — <b>{prof}</b>)"
+                keyboard.append([
+                    InlineKeyboardButton("▶️ Continue", callback_data=f"continue_conv:{c_id}"),
+                    InlineKeyboardButton("🔍 Preview", callback_data=f"preview:{c_id}"),
+                    InlineKeyboardButton(f"👁️ Peek {p}", callback_data=f"peek:{p}"),
+                ])
+            else:
+                st_line = "🟢 <b>Not Used</b> (Idle)"
+                keyboard.append([
+                    InlineKeyboardButton("▶️ Continue", callback_data=f"continue_conv:{c_id}"),
+                    InlineKeyboardButton("🔍 Preview", callback_data=f"preview:{c_id}"),
+                    InlineKeyboardButton("💬 Select", callback_data=f"resume:{c_id}"),
+                ])
+            lines.append(
+                f"• <b><code>{c_id}</code></b> — {size_mb} MB ({steps:,} steps)\n"
+                f"  Status: {st_line}\n"
+                f"  Prompt: <i>{title}</i>"
+            )
+        text = "\n\n".join(lines)
+        markup = InlineKeyboardMarkup(keyboard)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            await query.message.reply_html(text, reply_markup=markup)
+        await query.answer()
 
     elif data.startswith("kill_inst:"):
         pid_str = data.split(":", 1)[1]
@@ -2063,6 +2431,8 @@ async def _execute_and_reply(
             header = format_task_completed_header(profile=profile, cid=conv_id, title=title)
             btn_row = []
             if conv_id:
+                btn_row.append(InlineKeyboardButton("▶️ Continue", callback_data=f"continue_conv:{conv_id}"))
+                btn_row.append(InlineKeyboardButton("🔍 Preview", callback_data=f"preview:{conv_id}"))
                 btn_row.append(InlineKeyboardButton("💬 Select", callback_data=f"resume:{conv_id}"))
             markup = InlineKeyboardMarkup([btn_row]) if btn_row else None
             await send_response_or_file(
@@ -2091,6 +2461,8 @@ async def post_init(application) -> None:
         BotCommand("instances", "List active mgy / agy PIDs and status"),
         BotCommand("quotas", "Get all mgy quotas per account."),
         BotCommand("conversations", "List imported conversations"),
+        BotCommand("continue", "Continue conversation: /continue [cid]"),
+        BotCommand("preview", "Preview conversation history without opening: /preview [cid]"),
         BotCommand("peek", "Get latest answer/stream: /peek <pid>"),
         BotCommand("run", "Run prompt on instance: /run <pid> [prompt]"),
         BotCommand("new", "Bind session: /new <profile> [conv]"),
@@ -2148,6 +2520,8 @@ def main() -> None:
     app.add_handler(CommandHandler("instances", instances_command))
     app.add_handler(CommandHandler("quotas", quotas_command))
     app.add_handler(CommandHandler("conversations", conversations_command))
+    app.add_handler(CommandHandler("continue", continue_command))
+    app.add_handler(CommandHandler("preview", preview_command))
     app.add_handler(CommandHandler("peek", peek_command))
     app.add_handler(CommandHandler("tail", peek_command))
     app.add_handler(CommandHandler("output", peek_command))

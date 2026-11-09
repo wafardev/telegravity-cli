@@ -523,16 +523,37 @@ class SessionMonitor:
 
         if path and os.path.exists(path):
             try:
+                target_step = None
                 with open(path, "r", errors="replace") as f:
                     lines = f.readlines()
                 for line in reversed(lines):
                     try:
                         data = json.loads(line)
-                        if data.get("type") == "PLANNER_RESPONSE" and data.get("content"):
-                            output = data.get("content", "").strip()
+                        if data.get("type") == "PLANNER_RESPONSE":
+                            target_step = data.get("step_index")
+                            if "content" not in data.get("truncated_fields", []) and data.get("content"):
+                                output = data.get("content", "").strip()
                             break
                     except Exception:
                         pass
+                if (not output or (target_step is not None and not output)):
+                    full_p = path.replace("transcript.jsonl", "transcript_full.jsonl")
+                    if os.path.exists(full_p):
+                        size_full = os.path.getsize(full_p)
+                        with open(full_p, "rb") as f_full:
+                            f_full.seek(max(0, size_full - 1500000))
+                            chunk_full = f_full.read().decode("utf-8", errors="replace")
+                        for l_full in reversed(chunk_full.splitlines()):
+                            if "PLANNER_RESPONSE" in l_full:
+                                try:
+                                    df = json.loads(l_full)
+                                    if df.get("type") == "PLANNER_RESPONSE":
+                                        if target_step is None or df.get("step_index") == target_step:
+                                            output = df.get("content", "").strip()
+                                            if output:
+                                                break
+                                except Exception:
+                                    pass
             except Exception:
                 pass
 
@@ -581,13 +602,31 @@ class SessionMonitor:
             "output = ''\n"
             "if path and os.path.exists(path):\n"
             "    try:\n"
-            "        with open(path, 'r', errors='replace') as f:\n"
-            "            lines = f.readlines()\n"
+            "        target_step = None\n"
+            "        with open(path, 'r', errors='replace') as f: lines = f.readlines()\n"
             "        for l in reversed(lines):\n"
             "            data = json.loads(l)\n"
-            "            if data.get('type') == 'PLANNER_RESPONSE' and data.get('content'):\n"
-            "                output = data.get('content', '').strip()\n"
+            "            if data.get('type') == 'PLANNER_RESPONSE':\n"
+            "                target_step = data.get('step_index')\n"
+            "                if 'content' not in data.get('truncated_fields', []) and data.get('content'):\n"
+            "                    output = data.get('content', '').strip()\n"
             "                break\n"
+            "        if (not output or (target_step is not None and not output)):\n"
+            "            full_p = path.replace('transcript.jsonl', 'transcript_full.jsonl')\n"
+            "            if os.path.exists(full_p):\n"
+            "                size_full = os.path.getsize(full_p)\n"
+            "                with open(full_p, 'rb') as f_full:\n"
+            "                    f_full.seek(max(0, size_full - 1500000))\n"
+            "                    chunk_full = f_full.read().decode('utf-8', errors='replace')\n"
+            "                for l_full in reversed(chunk_full.splitlines()):\n"
+            "                    if 'PLANNER_RESPONSE' in l_full:\n"
+            "                        try:\n"
+            "                            df = json.loads(l_full)\n"
+            "                            if df.get('type') == 'PLANNER_RESPONSE':\n"
+            "                                if target_step is None or df.get('step_index') == target_step:\n"
+            "                                    output = df.get('content', '').strip()\n"
+            "                                    if output: break\n"
+            "                        except: pass\n"
             "    except: pass\n"
             "if not output:\n"
             "    cand_logs = glob.glob(os.path.expanduser('~/.gemini/antigravity-cli/log/cli-*.log')) + glob.glob(os.path.expanduser('~/.config/multigravity-profiles/*/.gemini/antigravity-cli/log/cli-*.log'))\n"

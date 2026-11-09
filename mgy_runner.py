@@ -1469,6 +1469,248 @@ print(json.dumps({"found": True, "conversation_id": found_cid, "conversation_tit
             "content": "(No conversation or transcript data found for this instance)",
         }
 
+    async def preview_conversation(self, conversation_id: str) -> Dict[str, Any]:
+        """Fetches preview metadata, last user prompt, and latest model response for a conversation without opening it."""
+        if not conversation_id:
+            return {}
+        if self.mode == "local":
+            return await asyncio.to_thread(self._preview_conversation_sync, conversation_id)
+
+        import base64
+        script = (
+            "import json, os, glob, sqlite3, re\n"
+            f"cid = '{conversation_id}'.strip()\n"
+            "full_cid = cid\n"
+            "title = ''\n"
+            "step_count = 0\n"
+            "status = 'idle'\n"
+            "last_mod = ''\n"
+            "profile = ''\n"
+            "dbs = glob.glob(os.path.expanduser('~/.config/multigravity-profiles/*/.gemini/antigravity-cli/conversation_summaries.db')) + glob.glob(os.path.expanduser('~/.gemini/antigravity-cli/conversation_summaries.db'))\n"
+            "for db in dbs:\n"
+            "    if os.path.exists(db):\n"
+            "        try:\n"
+            "            conn = sqlite3.connect(db); conn.row_factory = sqlite3.Row\n"
+            "            row = conn.execute('SELECT conversation_id, title, step_count, status, datetime(last_modified_time) as last_mod FROM conversation_summaries WHERE conversation_id = ? OR conversation_id LIKE ? ORDER BY last_modified_time DESC LIMIT 1', (cid, f'{cid}%')).fetchone()\n"
+            "            if row:\n"
+            "                full_cid = row['conversation_id']; title = row['title'] or ''; step_count = row['step_count'] or 0; status = row['status'] or 'idle'; last_mod = row['last_mod'] or ''\n"
+            "                m_prof = re.search(r'multigravity-profiles/([^/]+)/', db)\n"
+            "                if m_prof: profile = m_prof.group(1)\n"
+            "                break\n"
+            "        except: pass\n"
+            "cand_dirs = [os.path.expanduser(f'~/.gemini/antigravity-cli/brain/{full_cid}/.system_generated/logs')] + glob.glob(os.path.expanduser(f'~/.config/multigravity-profiles/*/.gemini/antigravity-cli/brain/{full_cid}/.system_generated/logs'))\n"
+            "if not any(os.path.exists(d) for d in cand_dirs):\n"
+            "    pfx = glob.glob(os.path.expanduser(f'~/.gemini/antigravity-cli/brain/{cid}*/.system_generated/logs')) + glob.glob(os.path.expanduser(f'~/.config/multigravity-profiles/*/.gemini/antigravity-cli/brain/{cid}*/.system_generated/logs'))\n"
+            "    if pfx:\n"
+            "        cand_dirs = pfx\n"
+            "        m_cid = re.search(r'/brain/([^/]+)/', pfx[0])\n"
+            "        if m_cid: full_cid = m_cid.group(1)\n"
+            "log_dir = next((d for d in cand_dirs if os.path.exists(d)), None)\n"
+            "last_user_prompt = ''\n"
+            "latest_output = ''\n"
+            "size_mb = 0.0\n"
+            "if log_dir:\n"
+            "    if not profile:\n"
+            "        m_prof = re.search(r'multigravity-profiles/([^/]+)/', log_dir)\n"
+            "        if m_prof: profile = m_prof.group(1)\n"
+            "    t_file = os.path.join(log_dir, 'transcript.jsonl')\n"
+            "    t_full_file = os.path.join(log_dir, 'transcript_full.jsonl')\n"
+            "    if os.path.exists(t_file):\n"
+            "        size_mb = round(os.path.getsize(t_file) / (1024 * 1024), 2)\n"
+            "        try:\n"
+            "            with open(t_file, 'r', errors='replace') as f: lines = f.readlines()\n"
+            "            if not step_count: step_count = len(lines)\n"
+            "            for l in reversed(lines):\n"
+            "                try:\n"
+            "                    d = json.loads(l)\n"
+            "                    if d.get('type') == 'USER_INPUT' and d.get('content'):\n"
+            "                        raw = d.get('content', '')\n"
+            "                        m = re.search(r'<USER_REQUEST>(.*?)</USER_REQUEST>', raw, re.DOTALL)\n"
+            "                        last_user_prompt = m.group(1).strip() if m else raw.strip()\n"
+            "                        break\n"
+            "                except: pass\n"
+            "            target_step = None\n"
+            "            for l in reversed(lines):\n"
+            "                try:\n"
+            "                    d = json.loads(l)\n"
+            "                    if d.get('type') == 'PLANNER_RESPONSE':\n"
+            "                        target_step = d.get('step_index')\n"
+            "                        if 'content' not in d.get('truncated_fields', []) and d.get('content'):\n"
+            "                            latest_output = d.get('content', '').strip()\n"
+            "                        break\n"
+            "                except: pass\n"
+            "            if (not latest_output or (target_step is not None and not latest_output)) and os.path.exists(t_full_file):\n"
+            "                size_full = os.path.getsize(t_full_file)\n"
+            "                with open(t_full_file, 'rb') as f:\n"
+            "                    f.seek(max(0, size_full - 1500000))\n"
+            "                    chunk_full = f.read().decode('utf-8', errors='replace')\n"
+            "                for l in reversed(chunk_full.splitlines()):\n"
+            "                    if 'PLANNER_RESPONSE' in l:\n"
+            "                        try:\n"
+            "                            d = json.loads(l)\n"
+            "                            if d.get('type') == 'PLANNER_RESPONSE':\n"
+            "                                if target_step is None or d.get('step_index') == target_step:\n"
+            "                                    latest_output = d.get('content', '').strip()\n"
+            "                                    if latest_output: break\n"
+            "                        except: pass\n"
+            "        except: pass\n"
+            "if not title and last_user_prompt:\n"
+            "    fl = last_user_prompt.splitlines()[0].strip()\n"
+            "    title = fl[:50] + ('...' if len(fl) > 50 else '')\n"
+            "print(json.dumps({\n"
+            "    'conversation_id': full_cid,\n"
+            "    'title': title or '(untitled)',\n"
+            "    'profile': profile or 'default',\n"
+            "    'step_count': step_count,\n"
+            "    'status': status.replace('CASCADE_RUN_STATUS_', '').lower(),\n"
+            "    'last_modified': last_mod,\n"
+            "    'last_user_prompt': last_user_prompt,\n"
+            "    'latest_output': latest_output,\n"
+            "    'size_mb': size_mb,\n"
+            "}))\n"
+        )
+        b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        code, out, _ = await self.run_raw(f"python3 -c \"import base64; exec(base64.b64decode('{b64}').decode('utf-8'))\"", timeout=10)
+        if code == 0 and out.strip():
+            try:
+                return json.loads(out.strip())
+            except Exception:
+                pass
+        return {}
+
+    def _preview_conversation_sync(self, conversation_id: str) -> Dict[str, Any]:
+        import json, os, glob, sqlite3, re
+        cid = conversation_id.strip() if conversation_id else ""
+        if not cid:
+            return {}
+
+        full_cid = cid
+        title = ""
+        step_count = 0
+        status = "idle"
+        last_mod = ""
+        profile = ""
+
+        dbs = glob.glob(os.path.expanduser("~/.config/multigravity-profiles/*/.gemini/antigravity-cli/conversation_summaries.db")) + glob.glob(
+            os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+        )
+        for db in dbs:
+            if os.path.exists(db):
+                try:
+                    conn = sqlite3.connect(db)
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT conversation_id, title, step_count, status, datetime(last_modified_time) as last_mod FROM conversation_summaries WHERE conversation_id = ? OR conversation_id LIKE ? ORDER BY last_modified_time DESC LIMIT 1",
+                        (cid, f"{cid}%"),
+                    ).fetchone()
+                    if row:
+                        full_cid = row["conversation_id"]
+                        title = row["title"] or ""
+                        step_count = row["step_count"] or 0
+                        status = row["status"] or "idle"
+                        last_mod = row["last_mod"] or ""
+                        m_prof = re.search(r"multigravity-profiles/([^/]+)/", db)
+                        if m_prof:
+                            profile = m_prof.group(1)
+                        break
+                except Exception:
+                    pass
+
+        cand_dirs = [
+            os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{full_cid}/.system_generated/logs")
+        ] + glob.glob(os.path.expanduser(f"~/.config/multigravity-profiles/*/.gemini/antigravity-cli/brain/{full_cid}/.system_generated/logs"))
+
+        if not any(os.path.exists(d) for d in cand_dirs):
+            prefix_matches = glob.glob(os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{cid}*/.system_generated/logs")) + glob.glob(
+                os.path.expanduser(f"~/.config/multigravity-profiles/*/.gemini/antigravity-cli/brain/{cid}*/.system_generated/logs")
+            )
+            if prefix_matches:
+                cand_dirs = prefix_matches
+                m_cid = re.search(r"/brain/([^/]+)/", prefix_matches[0])
+                if m_cid:
+                    full_cid = m_cid.group(1)
+
+        log_dir = next((d for d in cand_dirs if os.path.exists(d)), None)
+        last_user_prompt = ""
+        latest_output = ""
+        size_mb = 0.0
+
+        if log_dir:
+            if not profile:
+                m_prof = re.search(r"multigravity-profiles/([^/]+)/", log_dir)
+                if m_prof:
+                    profile = m_prof.group(1)
+
+            t_file = os.path.join(log_dir, "transcript.jsonl")
+            t_full_file = os.path.join(log_dir, "transcript_full.jsonl")
+
+            if os.path.exists(t_file):
+                size_mb = round(os.path.getsize(t_file) / (1024 * 1024), 2)
+                try:
+                    with open(t_file, "r", errors="replace") as f:
+                        lines = f.readlines()
+
+                    if not step_count:
+                        step_count = len(lines)
+
+                    for l in reversed(lines):
+                        try:
+                            d = json.loads(l)
+                            if d.get("type") == "USER_INPUT" and d.get("content"):
+                                raw = d.get("content", "")
+                                m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", raw, re.DOTALL)
+                                last_user_prompt = m.group(1).strip() if m else raw.strip()
+                                break
+                        except Exception:
+                            pass
+
+                    target_step = None
+                    for l in reversed(lines):
+                        try:
+                            d = json.loads(l)
+                            if d.get("type") == "PLANNER_RESPONSE":
+                                target_step = d.get("step_index")
+                                if "content" not in d.get("truncated_fields", []) and d.get("content"):
+                                    latest_output = d.get("content", "").strip()
+                                break
+                        except Exception:
+                            pass
+
+                    if (not latest_output or (target_step is not None and not latest_output)) and os.path.exists(t_full_file):
+                        size_full = os.path.getsize(t_full_file)
+                        with open(t_full_file, "rb") as f:
+                            f.seek(max(0, size_full - 1500000))
+                            chunk_full = f.read().decode("utf-8", errors="replace")
+                        for l in reversed(chunk_full.splitlines()):
+                            if "PLANNER_RESPONSE" in l:
+                                try:
+                                    d = json.loads(l)
+                                    if d.get("type") == "PLANNER_RESPONSE":
+                                        if target_step is None or d.get("step_index") == target_step:
+                                            latest_output = d.get("content", "").strip()
+                                            if latest_output:
+                                                break
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+        if not title and last_user_prompt:
+            first_line = last_user_prompt.splitlines()[0].strip()
+            title = first_line[:50] + ("..." if len(first_line) > 50 else "")
+
+        return {
+            "conversation_id": full_cid,
+            "title": title or "(untitled)",
+            "profile": profile or self.default_profile or "default",
+            "step_count": step_count,
+            "status": status.replace("CASCADE_RUN_STATUS_", "").lower(),
+            "last_modified": last_mod,
+            "last_user_prompt": last_user_prompt,
+            "latest_output": latest_output,
+            "size_mb": size_mb,
+        }
+
     async def get_last_user_prompt(self, conversation_id: str) -> str:
         """Retrieves the latest USER_INPUT prompt from transcript.jsonl."""
         if not conversation_id:
