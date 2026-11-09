@@ -448,6 +448,11 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
             logger.warning("Quota depleted for PID %s (%s). Terminating process.", pid, profile)
             await runner.kill_process(pid)
 
+        # Deduplicate: if already delivered by _execute_and_reply or SessionMonitor, skip duplicate
+        if not mark_response_delivered(cid, None, output_text):
+            logger.info("Quota alert for %s already delivered. Skipping duplicate.", cid)
+            return True
+
         header = f"🔴 <b>Quota Limit Reached!</b>\n<b>Session:</b> <code>{html.escape(title)}</code> (<code>{cid}</code>)"
         if pid:
             header += f"\n<i>Process PID <code>{pid}</code> terminated due to quota exhaustion.</i>"
@@ -458,6 +463,16 @@ async def on_external_task_completed(conv_info: dict, output_text: str, applicat
             ]
         ]
     else:
+        # Check if output_text actually contains quota error
+        if "Individual quota reached" in output_text or "RESOURCE_EXHAUSTED" in output_text:
+            logger.warning("Quota detected in on_external_task_completed else branch for %s. Skipping Task Completed.", cid)
+            return True
+
+        clean_out = normalize_model_output(output_text)
+        if not clean_out:
+            logger.warning("Empty output in on_external_task_completed for %s. Skipping delivery.", cid)
+            return True
+
         # Normal / valid response: return answer and keep process idle (do NOT kill process)
         filter_retry_tracker.pop(retry_key, None)
         if cid and title:
@@ -954,9 +969,20 @@ async def _wait_for_injected_response(
                             reply_markup=markup,
                         )
                 else:
+                    # Check if final_text contains quota error or is empty
+                    if "Individual quota reached" in final_text or "RESOURCE_EXHAUSTED" in final_text:
+                        logger.warning("Quota error detected in final_text on PID %s. Killing process and skipping Task Completed.", pid)
+                        await runner.kill_process(pid)
+                        return
+
+                    clean_text = normalize_model_output(final_text)
+                    if not clean_text:
+                        logger.warning("Empty model response for %s. Skipping Task Completed.", cid)
+                        return
+
                     # Normal / valid response: deliver response and keep process idle (do NOT kill process)
                     filter_retry_tracker.pop(retry_key, None)
-                    if not mark_response_delivered(cid, curr_step, final_text):
+                    if not mark_response_delivered(cid, curr_step, clean_text):
                         logger.info("Response for %s (step %s) already delivered. Skipping duplicate.", cid, curr_step)
                     else:
                         conv_title = info.get("conversation_title")
@@ -966,7 +992,7 @@ async def _wait_for_injected_response(
                         await send_response_or_file(
                             chat_id=chat_id,
                             bot=context.bot,
-                            text=final_text,
+                            text=clean_text,
                             header=header,
                             filename=f"response_{cid[:8] if cid else pid}.txt",
                             reply_markup=markup,
@@ -1926,6 +1952,7 @@ async def _execute_and_reply(
         except Exception:
             pass
 
+        combined = f"{out}\n{err}".strip()
         output = out.strip()
         if not output and err.strip():
             output = err.strip()
@@ -1936,7 +1963,43 @@ async def _execute_and_reply(
             last_sent_prompts[conv_id] = prompt
         retry_key = conv_id or profile
 
-        if is_gemini_filter_blocked(output):
+        # 1. Check for Quota Exhaustion first across out, err, and recent logs
+        is_quota = bool(re.search(r"Individual quota reached|RESOURCE_EXHAUSTED|quota reached", combined, re.IGNORECASE))
+        if not is_quota and (code != 0 or not normalize_model_output(output)):
+            latest_check = await monitor.get_latest_output(conv_id) if conv_id else ""
+            if "Individual quota reached" in latest_check or "RESOURCE_EXHAUSTED" in latest_check:
+                is_quota = True
+                combined = latest_check
+
+        if is_quota:
+            logger.warning("Quota depleted detected for profile %s (conv: %s).", profile, conv_id)
+            m_quota = re.search(r"(Individual quota reached[^\n\r]+)", combined)
+            quota_msg = ("⚠️ " + m_quota.group(1).strip()) if m_quota else "⚠️ Individual quota reached."
+
+            if not mark_response_delivered(conv_id, None, quota_msg):
+                logger.info("Quota alert for %s already delivered. Skipping duplicate.", conv_id)
+                return
+
+            title = await get_conversation_title(conv_id) if conv_id else ""
+            header = f"🔴 <b>Quota Limit Reached!</b>\n<b>Session:</b> <code>{html.escape(title or 'Active Session')}</code> (<code>{conv_id}</code>)"
+            keyboard = [
+                [
+                    InlineKeyboardButton("📊 Check Quotas", callback_data="do_quotas"),
+                    InlineKeyboardButton("✨ New Session", callback_data="new_session"),
+                ]
+            ]
+            await send_response_or_file(
+                chat_id=chat_id,
+                bot=context.bot,
+                text=quota_msg,
+                header=header,
+                filename=f"quota_{profile}.txt",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+
+        # 2. Check for Gemini filter blocks
+        if is_gemini_filter_blocked(combined):
             retries = filter_retry_tracker.get(retry_key, 0)
             if retries == 0:
                 filter_retry_tracker[retry_key] = 1
@@ -1977,18 +2040,16 @@ async def _execute_and_reply(
                     text=f"{header}\n\n{body_text}",
                     parse_mode="HTML",
                 )
-        elif "Individual quota reached" in output or "RESOURCE_EXHAUSTED" in output:
-            header = f"🔴 <b>Quota Limit Reached (profile: {profile})</b>:\n<i>Task stopped due to quota exhaustion.</i>"
-            await send_response_or_file(
-                chat_id=chat_id,
-                bot=context.bot,
-                text=output,
-                header=header,
-                filename=f"response_{profile}.txt",
-            )
         else:
             filter_retry_tracker.pop(retry_key, None)
             clean_output = normalize_model_output(output)
+            if not clean_output:
+                if err.strip():
+                    clean_output = err.strip()
+                else:
+                    logger.warning("Task finished with empty model output for %s. Skipping Task Completed.", conv_id)
+                    return
+
             if not mark_response_delivered(conv_id, None, clean_output):
                 logger.info("Task completion for %s already delivered by SessionMonitor. Skipping duplicate.", conv_id)
                 return
